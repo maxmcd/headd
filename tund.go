@@ -70,6 +70,7 @@ func NewServer(addr string) *Server {
 			Fprintfln(resp, "Command failed: %s", err)
 		}
 		_ = stream.Close()
+
 	})
 
 	mux.HandleFunc("/pty", func(w http.ResponseWriter, r *http.Request) {
@@ -80,15 +81,30 @@ func NewServer(addr string) *Server {
 			Fprintfln(resp, "upgrading failed: %s", err)
 			return
 		}
+
+		controlStream, err := sess.AcceptStream(context.Background())
+		if err != nil {
+			log.Panicln(err)
+		}
+		var b [len("hello")]byte
+		if _, err := controlStream.Read(b[:]); err != nil {
+			Fprintfln(resp, "reading from control stream failed: %s", err)
+			return
+		}
+		if string(b[:]) != "hello" {
+			Fprintfln(resp, "control stream returned unexpected message: %s", string(b[:]))
+			return
+		}
+
 		stream, err := sess.AcceptStream(r.Context())
 		if err != nil {
 			w.WriteHeader(500)
 			Fprintfln(resp, "accepting stream failed: %s", err)
 			return
 		}
+
 		fmt.Println("Got new stream")
 		cmd := exec.Command("bash")
-		cmd.Env = append(os.Environ(), "TERM=xterm")
 		ptmx, err := pty.Start(cmd)
 		if err != nil {
 			Fprintfln(resp, "starting pty failed: %s", err)
@@ -187,17 +203,26 @@ func (c *Client) Pty() error {
 	if err != nil {
 		return fmt.Errorf("Response error: %w", err)
 	}
+
 	if resp.StatusCode != http.StatusOK {
 		b, _ := io.ReadAll(resp.Body)
 		return fmt.Errorf("Response error: %d %s", resp.StatusCode, string(b))
 	}
+	controlStream, err := sess.OpenStreamSync(context.Background())
+	if err != nil {
+		return fmt.Errorf("opening control stream failed: %w", err)
+	}
+	defer controlStream.Close()
+	if _, err := controlStream.Write([]byte("hello")); err != nil {
+		return fmt.Errorf("writing to control stream failed: %w", err)
+	}
 	stream, err := sess.OpenStreamSync(context.Background())
 	if err != nil {
-		log.Panicln(err)
+		return fmt.Errorf("f")
 	}
 	defer stream.Close()
 	closer := make(chan struct{}, 2)
-	stream.Write([]byte(nil))
+	controlStream.Write([]byte(nil))
 	go copy(closer, os.Stdout, stream)
 	go copy(closer, stream, os.Stdin)
 	<-closer
