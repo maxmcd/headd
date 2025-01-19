@@ -1,4 +1,4 @@
-package tund
+package tunneld
 
 import (
 	"context"

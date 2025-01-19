@@ -1,12 +1,14 @@
-package tund
+package tunneld
 
 import (
 	"context"
 	"crypto/tls"
 	"fmt"
 	"net"
+	"sync"
 	"time"
 
+	"github.com/maxmcd/tunneld/rpc"
 	"github.com/quic-go/quic-go"
 )
 
@@ -14,7 +16,7 @@ type ProxyServer struct {
 	publicAddr string
 	clientAddr string
 
-	conn *quic.EarlyConnection
+	conn *ConnectedClient
 }
 
 func NewProxyServer(publicAddr, clientAddr string) *ProxyServer {
@@ -22,6 +24,11 @@ func NewProxyServer(publicAddr, clientAddr string) *ProxyServer {
 		publicAddr: publicAddr,
 		clientAddr: clientAddr,
 	}
+}
+
+type ConnectedClient struct {
+	conn   quic.EarlyConnection
+	client *rpc.Client
 }
 
 func (p *ProxyServer) ClientListen() error {
@@ -47,7 +54,17 @@ func (p *ProxyServer) ClientListen() error {
 			return fmt.Errorf("accepting quic connection failed: %w", err)
 		}
 		fmt.Println("accepted quic connection")
-		p.conn = &conn
+		controlStream, err := conn.OpenStreamSync(context.Background())
+		if err != nil {
+			return fmt.Errorf("accepting control stream failed: %w", err)
+		}
+		p.conn = &ConnectedClient{
+			conn:   conn,
+			client: rpc.NewClient(controlStream),
+		}
+		if err := p.conn.client.Hello(); err != nil {
+			return fmt.Errorf("hello failed: %w", err)
+		}
 	}
 }
 
@@ -69,21 +86,26 @@ func (p *ProxyServer) PublicListen() error {
 			continue
 		}
 		go func() {
-			if err := p.handleConn(*p.conn, conn); err != nil {
+			if err := p.handleConn(p.conn, conn); err != nil {
 				fmt.Println("error handling connection:", err)
 			}
 		}()
 	}
-	return nil
 }
 
-func (p *ProxyServer) handleConn(conn quic.EarlyConnection, publicConn net.Conn) error {
-	stream, err := conn.OpenStreamSync(context.Background())
+func (p *ProxyServer) handleConn(conn *ConnectedClient, publicConn net.Conn) error {
+	stream, err := conn.conn.OpenStreamSync(context.Background())
 	if err != nil {
 		return fmt.Errorf("opening stream failed: %w", err)
 	}
+	if err := conn.client.NewConnection(rpc.Connection{
+		StreamID: int64(stream.StreamID()),
+		Addr:     "localhost:4443",
+	}); err != nil {
+		return fmt.Errorf("new connection failed: %w", err)
+	}
 	defer stream.Close()
-	closer := make(chan struct{}, 2)
+	closer := make(chan error, 2)
 	go copy(closer, publicConn, stream)
 	go copy(closer, stream, publicConn)
 	<-closer
@@ -92,14 +114,42 @@ func (p *ProxyServer) handleConn(conn quic.EarlyConnection, publicConn net.Conn)
 
 type ProxyClient struct {
 	localAddr string
+
+	streamErrorsLock sync.Mutex
+	streamErrors     map[quic.StreamID]error
+
+	connectionsLock sync.Mutex
+	connections     map[quic.StreamID]string
 }
 
 func NewProxyClient(localAddr string) *ProxyClient {
 	return &ProxyClient{
-		localAddr: localAddr,
+		localAddr:    localAddr,
+		streamErrors: make(map[quic.StreamID]error),
+		connections:  make(map[quic.StreamID]string),
 	}
 }
 
+func (p *ProxyClient) handleStreamProxy(ctx context.Context, stream quic.Stream) error {
+	defer stream.Close()
+	conn, err := net.Dial("tcp", p.localAddr)
+	if err != nil {
+		return fmt.Errorf("dialing tcp failed: %w", err)
+	}
+	defer conn.Close()
+	closer := make(chan error, 2)
+	go copy(closer, conn, stream)
+	go copy(closer, stream, conn)
+	select {
+	case err := <-closer:
+		return err
+	case <-ctx.Done():
+		return fmt.Errorf("context cancelled")
+	}
+}
+
+// Dial phones home to the server and sets up the connection to proxy traffic
+// over.
 func (p *ProxyClient) Dial(ctx context.Context, addr string) error {
 	tlsCert, err := tls.LoadX509KeyPair("server.crt", "server.key")
 	if err != nil {
@@ -122,22 +172,47 @@ func (p *ProxyClient) Dial(ctx context.Context, addr string) error {
 	if err != nil {
 		return fmt.Errorf("quic dialAddr failed: %w", err)
 	}
+	ctx, cancel := context.WithCancel(context.Background())
+	controlStream, err := conn.AcceptStream(ctx)
+	if err != nil {
+		return fmt.Errorf("accepting stream failed: %w", err)
+	}
+	go func() {
+		defer controlStream.Close()
+		rpc.StartServer(controlStream, rpc.NewInlineServer(
+			func(conn rpc.Connection, resp *int) error {
+				fmt.Println("new connection", conn.StreamID, conn.Addr)
+				p.connectionsLock.Lock()
+				p.connections[quic.StreamID(conn.StreamID)] = conn.Addr
+				p.connectionsLock.Unlock()
+				return nil
+			},
+			func(streamID int64, err *error) error {
+				fmt.Println("stream error", streamID, *err)
+				p.streamErrorsLock.Lock()
+				p.streamErrors[quic.StreamID(streamID)] = *err
+				p.streamErrorsLock.Unlock()
+				return nil
+			},
+			func(req int, resp *int) error {
+				return nil
+			},
+		))
+		cancel()
+	}()
+
 	for {
-		stream, err := conn.AcceptStream(context.Background())
+		stream, err := conn.AcceptStream(ctx)
 		if err != nil {
 			return fmt.Errorf("accepting stream failed: %w", err)
 		}
+		fmt.Println("accepting stream", stream.StreamID())
 		go func() {
-			conn, err := net.Dial("tcp", p.localAddr)
-			if err != nil {
-				return
+			if err := p.handleStreamProxy(ctx, stream); err != nil {
+				p.streamErrorsLock.Lock()
+				p.streamErrors[stream.StreamID()] = err
+				p.streamErrorsLock.Unlock()
 			}
-			defer conn.Close()
-			closer := make(chan struct{}, 2)
-			go copy(closer, conn, stream)
-			go copy(closer, stream, conn)
-			<-closer
 		}()
 	}
-
 }

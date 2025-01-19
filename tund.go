@@ -1,4 +1,4 @@
-package tund
+package tunneld
 
 import (
 	"context"
@@ -128,7 +128,7 @@ func NewServer(addr string) *Server {
 			Fprintfln(resp, "setting pty size failed: %s", err)
 			return
 		}
-		closer := make(chan struct{}, 2)
+		closer := make(chan error, 2)
 		go copy(closer, ptmx, stream)
 		go copy(closer, stream, ptmx)
 		<-closer
@@ -221,7 +221,7 @@ func (c *Client) Pty() error {
 		return fmt.Errorf("f")
 	}
 	defer stream.Close()
-	closer := make(chan struct{}, 2)
+	closer := make(chan error, 2)
 	controlStream.Write([]byte(nil))
 	go copy(closer, os.Stdout, stream)
 	go copy(closer, stream, os.Stdin)
@@ -229,7 +229,7 @@ func (c *Client) Pty() error {
 	return nil
 }
 
-func copy(closer chan struct{}, dst io.Writer, src io.Reader) {
-	_, _ = io.Copy(dst, src)
-	closer <- struct{}{} // connection is closed, send signal to stop proxy
+func copy(closer chan error, dst io.Writer, src io.Reader) {
+	_, err := io.Copy(dst, src)
+	closer <- err // connection is closed, send signal to stop proxy
 }
