@@ -22,12 +22,12 @@ func TestProxy(t *testing.T) {
 	proxy := NewProxyServer("localhost:4442", "localhost:4443")
 	go func() {
 		if err := proxy.ClientListen(); err != nil {
-			t.Fatal(err)
+			panic(err)
 		}
 	}()
 	go func() {
 		if err := proxy.PublicListen(); err != nil {
-			t.Fatal(err)
+			panic(err)
 		}
 	}()
 	time.Sleep(time.Millisecond * 100)
@@ -35,7 +35,7 @@ func TestProxy(t *testing.T) {
 	proxyClient := NewProxyClient(strings.TrimPrefix(ts.URL, "http://"))
 	go func() {
 		if err := proxyClient.Dial(context.Background(), "localhost:4443"); err != nil {
-			t.Fatal(err)
+			panic(err)
 		}
 	}()
 

@@ -175,11 +175,12 @@ func (p *ProxyClient) Dial(ctx context.Context, addr string) error {
 	ctx, cancel := context.WithCancel(context.Background())
 	controlStream, err := conn.AcceptStream(ctx)
 	if err != nil {
+		cancel()
 		return fmt.Errorf("accepting stream failed: %w", err)
 	}
 	go func() {
 		defer controlStream.Close()
-		rpc.StartServer(controlStream, rpc.NewInlineServer(
+		if err := rpc.StartServer(controlStream, rpc.NewInlineServer(
 			func(conn rpc.Connection, resp *int) error {
 				fmt.Println("new connection", conn.StreamID, conn.Addr)
 				p.connectionsLock.Lock()
@@ -197,13 +198,16 @@ func (p *ProxyClient) Dial(ctx context.Context, addr string) error {
 			func(req int, resp *int) error {
 				return nil
 			},
-		))
-		cancel()
+		)); err != nil {
+			cancel()
+			fmt.Printf("starting server failed: %v\n", err)
+		}
 	}()
 
 	for {
 		stream, err := conn.AcceptStream(ctx)
 		if err != nil {
+			cancel()
 			return fmt.Errorf("accepting stream failed: %w", err)
 		}
 		fmt.Println("accepting stream", stream.StreamID())

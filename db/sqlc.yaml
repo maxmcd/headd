@@ -1,0 +1,12 @@
+version: "2"
+sql:
+  - name: sqlite
+    schema: ./schema.sql
+    queries: ./query.sql
+    engine: sqlite
+    database:
+      uri: file:tunneld?mode=memory&cache=shared
+    gen:
+      go:
+        package: db
+        out: .

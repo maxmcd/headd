@@ -32,9 +32,12 @@ func NewClient(stream io.ReadWriteCloser) *Client {
 	}
 }
 
-func StartServer(stream io.ReadWriteCloser, server *InlineServer) {
-	rpc.Register(server)
+func StartServer(stream io.ReadWriteCloser, server *InlineServer) error {
+	if err := rpc.Register(server); err != nil {
+		return err
+	}
 	rpc.ServeConn(stream)
+	return nil
 }
 
 type Connection struct {
