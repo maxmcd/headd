@@ -5,6 +5,7 @@ go 1.23.3
 require (
 	github.com/quic-go/quic-go v0.43.0
 	github.com/tursodatabase/libsql-client-go v0.0.0-20240902231107-85af5b9d094d
+	golang.org/x/sync v0.6.0
 )
 
 require (

@@ -46,29 +46,23 @@ type Connection struct {
 }
 
 func NewInlineServer(
-	newConnection func(conn Connection, resp *int) error,
-	connectionError func(streamID int64, err *error) error,
 	hello func(req int, resp *int) error,
 ) *InlineServer {
 	return &InlineServer{
-		newConnection:   newConnection,
-		connectionError: connectionError,
-		hello:           hello,
+		hello: hello,
 	}
 }
 
 type InlineServer struct {
-	newConnection   func(conn Connection, resp *int) error
-	connectionError func(streamID int64, err *error) error
-	hello           func(req int, resp *int) error
+	hello func(req int, resp *int) error
 }
 
 func (s *InlineServer) NewConnection(conn Connection, resp *int) error {
-	return s.newConnection(conn, resp)
+	return nil
 }
 
 func (s *InlineServer) ConnectionError(streamID int64, err *error) error {
-	return s.connectionError(streamID, err)
+	return nil
 }
 
 func (s *InlineServer) Hello(req int, resp *int) error {
