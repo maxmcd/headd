@@ -7,20 +7,21 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"log/slog"
 	"net"
 	"net/netip"
 	"time"
 
-	"github.com/maxmcd/tunneld/rpc"
+	"github.com/maxmcd/tunneld/pkg/synctyped"
 	"github.com/quic-go/quic-go"
 	"golang.org/x/sync/errgroup"
 )
 
 type ProxyServer struct {
-	conn *ConnectedClient
-
-	AppAddr netip.AddrPort
+	clients   synctyped.Map[*ConnectedClient]
+	appHosts  synctyped.Map[AppPort]
+	tlsConfig *tls.Config
 }
 
 type RunningServer struct {
@@ -42,12 +43,24 @@ func (r *RunningServer) PublicAddr() net.Addr {
 }
 
 func NewProxyServer() *ProxyServer {
-	return &ProxyServer{}
+	tlsCert, err := tls.LoadX509KeyPair("server.crt", "server.key")
+	if err != nil {
+		log.Panicln(fmt.Errorf("loading certificates: %w", err))
+	}
+
+	return &ProxyServer{
+		clients:  synctyped.Map[*ConnectedClient]{},
+		appHosts: synctyped.Map[AppPort]{},
+		tlsConfig: &tls.Config{
+			InsecureSkipVerify: true,
+			Certificates:       []tls.Certificate{tlsCert},
+		},
+	}
 }
 
 type ConnectedClient struct {
 	conn   quic.Connection
-	client *rpc.Client
+	client *RPCClient
 }
 
 func (p *ProxyServer) ListenAddr(ctx context.Context, clientAddr string, publicAddr string) (*RunningServer, error) {
@@ -75,14 +88,7 @@ func (p *ProxyServer) ListenAddr(ctx context.Context, clientAddr string, publicA
 }
 
 func (p *ProxyServer) ClientListen(ctx context.Context, conn net.PacketConn) error {
-	tlsCert, err := tls.LoadX509KeyPair("server.crt", "server.key")
-	if err != nil {
-		return fmt.Errorf("loading certificates: %w", err)
-	}
-	listener, err := quic.Listen(conn, &tls.Config{
-		InsecureSkipVerify: true,
-		Certificates:       []tls.Certificate{tlsCert},
-	}, &quic.Config{
+	listener, err := quic.Listen(conn, p.tlsConfig, &quic.Config{
 		MaxIdleTimeout:  20 * time.Second,
 		KeepAlivePeriod: 10 * time.Second,
 		EnableDatagrams: true,
@@ -101,11 +107,17 @@ func (p *ProxyServer) ClientListen(ctx context.Context, conn net.PacketConn) err
 		if err != nil {
 			return fmt.Errorf("accepting control stream failed: %w", err)
 		}
-		p.conn = &ConnectedClient{
+		connName := conn.RemoteAddr().String()
+		connClient := &ConnectedClient{
 			conn:   conn,
-			client: rpc.NewClient(controlStream),
+			client: NewRPCClient(controlStream),
 		}
-		if err := p.conn.client.Hello(); err != nil {
+		fmt.Println("new conn", connName)
+		_, loaded := p.clients.LoadOrStore(connName, connClient)
+		if loaded {
+			return fmt.Errorf("conflicting client name %q", connName)
+		}
+		if err := connClient.client.Hello(); err != nil {
 			return fmt.Errorf("hello failed: %w", err)
 		}
 	}
@@ -118,18 +130,15 @@ func (p *ProxyServer) PublicListen(ctx context.Context, listener net.Listener) e
 		_ = listener.Close()
 	}()
 	for {
+
 		conn, err := listener.Accept()
 		if err != nil {
 			return fmt.Errorf("accepting tcp connection failed: %w", err)
 		}
-		if p.conn == nil {
-			fmt.Println("no connection to proxy")
-			conn.Close()
-			continue
-		}
 		go func() {
+			defer conn.Close()
 			fmt.Println("New public conn", conn)
-			if err := p.handleConn(ctx, p.conn, conn); err != nil {
+			if err := p.handleConn(ctx, conn); err != nil {
 				fmt.Println("New public conn", conn)
 
 				fmt.Println("error handling connection:", err)
@@ -138,21 +147,57 @@ func (p *ProxyServer) PublicListen(ctx context.Context, listener net.Listener) e
 	}
 }
 
-func (p *ProxyServer) handleConn(ctx context.Context, conn *ConnectedClient, publicConn net.Conn) error {
-	stream, err := conn.conn.OpenStreamSync(context.Background())
+func (p *ProxyServer) RegisterApp(app App) (AppPort, error) {
+	c := p.firstClient()
+
+	appPort, err := c.client.RegisterApp(app)
+	if err != nil {
+		return AppPort{}, fmt.Errorf("client.RegisterApp: %w", err)
+	}
+	slog.Debug("registered new app",
+		"conn", c.conn.RemoteAddr().String(),
+		"name", app.Name, "port", appPort.Port)
+	p.appHosts.Store(app.Name, appPort)
+	return appPort, nil
+}
+
+func (p *ProxyServer) firstClient() *ConnectedClient {
+	var out *ConnectedClient
+	p.clients.Range(func(key string, value *ConnectedClient) bool {
+		out = value
+		return false
+	})
+	return out
+}
+
+func (p *ProxyServer) handleConn(ctx context.Context, publicConn net.Conn) error {
+	var sni string
+	sniConn := tls.Server(publicConn, &tls.Config{
+		GetConfigForClient: func(hello *tls.ClientHelloInfo) (*tls.Config, error) {
+			slog.Debug("handleConn", "sni", hello.ServerName)
+			sni = hello.ServerName
+			return p.tlsConfig, nil
+		},
+	})
+
+	if err := sniConn.Handshake(); err != nil {
+		return fmt.Errorf("error handshaking %s %s: %w", publicConn.RemoteAddr(), sni, err)
+	}
+
+	app, ok := p.appHosts.Load(sni)
+	if !ok {
+		return fmt.Errorf("no matching app found for %q", sni)
+	}
+
+	connClient := p.firstClient()
+	stream, err := connClient.conn.OpenStreamSync(ctx)
 	if err != nil {
 		return fmt.Errorf("opening stream failed: %w", err)
 	}
 	defer stream.Close()
 
-	if err := conn.client.NewConnection(rpc.Connection{
-		StreamID: int64(stream.StreamID()),
-		Addr:     "localhost:4443",
-	}); err != nil {
-		return fmt.Errorf("new connection failed: %w", err)
-	}
-
-	b, err := p.AppAddr.MarshalBinary()
+	appAddr := netip.AddrPortFrom(netip.AddrFrom4([4]byte{127, 0, 0, 1}), uint16(app.Port))
+	b, err := appAddr.MarshalBinary()
 	if err != nil {
 		return fmt.Errorf("marshalling app addr: %w", err)
 	}
@@ -161,7 +206,7 @@ func (p *ProxyServer) handleConn(ctx context.Context, conn *ConnectedClient, pub
 	if n, err := stream.Write(b); err != nil {
 		return fmt.Errorf("writing to stream: %w", err)
 	} else if n < len(b) {
-		return fmt.Errorf("failed to write all addr bytes to stream: %s", p.AppAddr)
+		return fmt.Errorf("failed to write all addr bytes to stream: %s", appAddr)
 	}
 
 	var errLen uint16
@@ -177,17 +222,20 @@ func (p *ProxyServer) handleConn(ctx context.Context, conn *ConnectedClient, pub
 	}
 
 	closer := make(chan error, 2)
-	go copy(closer, publicConn, stream)
-	go copy(closer, stream, publicConn)
+	go copy(closer, sniConn, stream)
+	go copy(closer, stream, sniConn)
 	<-closer
 	return nil
 }
 
 type ProxyClient struct {
+	rpcServer *RPCServer
 }
 
 func NewProxyClient() *ProxyClient {
-	return &ProxyClient{}
+	return &ProxyClient{
+		rpcServer: NewRPCServer(),
+	}
 }
 
 func (p *ProxyClient) parseAndDialAddr(ctx context.Context, stream quic.Stream) (net.Conn, error) {
@@ -203,6 +251,7 @@ func (p *ProxyClient) parseAndDialAddr(ctx context.Context, stream quic.Stream) 
 	if err := ap.UnmarshalBinary(addrB); err != nil {
 		return nil, fmt.Errorf("unmarshaling addr: %w", err)
 	}
+	slog.Debug("dialing local app", "addr", ap)
 	conn, err := net.Dial("tcp", ap.String())
 	if err != nil {
 		return nil, fmt.Errorf("dialing tcp failed: %w", err)
@@ -272,11 +321,7 @@ func (p *ProxyClient) Dial(ctx context.Context, addr string) error {
 	}
 	go func() {
 		defer controlStream.Close()
-		if err := rpc.StartServer(controlStream, rpc.NewInlineServer(
-			func(req int, resp *int) error {
-				return nil
-			},
-		)); err != nil {
+		if err := p.rpcServer.Listen(controlStream); err != nil {
 			cancel()
 			fmt.Printf("starting server failed: %v\n", err)
 		}

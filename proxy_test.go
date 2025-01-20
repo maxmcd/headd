@@ -2,12 +2,14 @@ package tunneld_test
 
 import (
 	"context"
+	"crypto/tls"
 	"fmt"
 	"io"
+	"log"
+	"log/slog"
+	"net"
 	"net/http"
-	"net/http/httptest"
-	"net/netip"
-	"strings"
+	"os"
 	"testing"
 	"time"
 
@@ -15,12 +17,10 @@ import (
 )
 
 func TestProxy(t *testing.T) {
-	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		fmt.Println("got test server request")
-		fmt.Fprintln(w, "hello")
+	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{
+		Level: slog.LevelDebug,
 	}))
-
-	defer ts.Close()
+	slog.SetDefault(logger)
 	ctx := context.Background()
 	proxy := tunneld.NewProxyServer()
 	server, err := proxy.ListenAddr(ctx, "127.0.0.1:0", "127.0.0.1:0")
@@ -28,15 +28,6 @@ func TestProxy(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	port := uint16(0)
-	if parts := strings.Split(ts.URL, ":"); len(parts) > 2 {
-		if p, err := fmt.Sscanf(parts[2], "%d", &port); err != nil || p != 1 {
-			t.Fatal("failed to parse port from test server URL")
-		}
-	} else {
-		t.Fatal("test server URL missing port")
-	}
-	proxy.AppAddr = netip.AddrPortFrom(netip.AddrFrom4([4]byte{127, 0, 0, 1}), port)
 	clientAddr := server.ClientAddr().String()
 	publicAddr := server.PublicAddr().String()
 
@@ -56,13 +47,47 @@ func TestProxy(t *testing.T) {
 			panic(err)
 		}
 	}()
+	time.Sleep(time.Second)
+
+	appPort, err := proxy.RegisterApp(tunneld.App{
+		Command: "go",
+		Args:    []string{"run", "./sample-app/main.go"},
+		Name:    "sample-app",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	time.Sleep(time.Second)
-	fmt.Println("GET")
+	time.Sleep(time.Second)
+	fmt.Println(appPort)
+
+	tlsCert, err := tls.LoadX509KeyPair("server.crt", "server.key")
+	if err != nil {
+		log.Panicln(fmt.Errorf("loading certificates: %w", err))
+	}
+
 	client := http.Client{
 		Timeout: time.Millisecond * 100,
+		Transport: &http.Transport{
+			TLSClientConfig: &tls.Config{
+				InsecureSkipVerify: true,
+				Certificates:       []tls.Certificate{tlsCert},
+				ServerName:         appPort.App.Name,
+			},
+			DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+				return net.Dial(network, publicAddr)
+			},
+		},
 	}
-	resp, err := client.Get("http://" + publicAddr)
+
+	req, err := http.NewRequest("GET", "https://"+appPort.App.Name, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("host", appPort.App.Name)
+
+	resp, err := client.Do(req)
 	if err != nil {
 		t.Fatal(err)
 	}
