@@ -23,99 +23,39 @@ import (
 	"golang.org/x/net/http2/h2c"
 )
 
-type streamChanListener struct {
-	streams chan quic.Stream
+type streamConn struct {
+	stream quic.Stream
+	io.ReadWriteCloser
 }
 
-var _ net.Listener = new(streamChanListener)
+type quicChanListener struct {
+	streamChan chan quic.Stream
+}
 
-func (l *streamChanListener) Accept() (net.Conn, error) {
-	stream, ok := <-l.streams
+func (l *quicChanListener) Accept() (net.Conn, error) {
+	stream, ok := <-l.streamChan
+	fmt.Println("quicChanListener Accept", stream, ok)
 	if !ok {
-		return nil, fmt.Errorf("listener closed")
+		return nil, io.EOF
 	}
-	return &streamConn{stream: stream, server: true}, nil
+	return &streamConn{stream: stream, ReadWriteCloser: stream}, nil
 }
 
-func (l *streamChanListener) Close() error {
-	close(l.streams)
+func (l *quicChanListener) Close() error {
+	fmt.Println("closing quic listener")
+	close(l.streamChan)
 	return nil
 }
 
-func (l *streamChanListener) Addr() net.Addr {
-	return &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 9876}
+func (l *quicChanListener) Addr() net.Addr {
+	return &net.TCPAddr{IP: net.IPv4(0, 0, 0, 0), Port: 0}
 }
 
-type streamConn struct {
-	stream quic.Stream
-	server bool
-}
-
-func (c *streamConn) Read(b []byte) (n int, err error) {
-	fmt.Printf("streamConn.Read server=%v: reading %d bytes %v\n", c.server, len(b), c.stream.StreamID().StreamNum())
-	n, err = c.stream.Read(b)
-	fmt.Printf("streamConn.Read server=%v: read %d bytes, err: %v, data: %q\n", c.server, n, err, b[:n])
-	return n, err
-}
-
-func (c *streamConn) Write(b []byte) (n int, err error) {
-	fmt.Printf("streamConn.Write server=%v: writing %d bytes, data: %q\n", c.server, len(b), b)
-	n, err = c.stream.Write(b)
-	fmt.Printf("streamConn.Write server=%v: wrote %d bytes, err: %v\n", c.server, n, err)
-	return n, err
-}
-
-func (c *streamConn) Close() error {
-	fmt.Printf("streamConn.Close server=%v\n", c.server)
-	err := c.stream.Close()
-	fmt.Printf("streamConn.Close server=%v err: %v\n", c.server, err)
-	return err
-}
-
-func (c *streamConn) LocalAddr() net.Addr {
-	fmt.Printf("streamConn.LocalAddr server=%v\n", c.server)
-	var addr net.Addr
-	if c.server {
-		addr = &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 80}
-	} else {
-		addr = &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 8765}
-	}
-	fmt.Printf("streamConn.LocalAddr server=%v returning: %v\n", c.server, addr)
-	return addr
-}
-
-func (c *streamConn) RemoteAddr() net.Addr {
-	fmt.Printf("streamConn.RemoteAddr server=%v %v\n", c.server, c.stream.StreamID().StreamNum())
-	var addr net.Addr
-	if c.server {
-		addr = &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 8765}
-	} else {
-		addr = &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 80}
-	}
-	fmt.Printf("streamConn.RemoteAddr server=%v returning: %v\n", c.server, addr)
-	return addr
-}
-
-func (c *streamConn) SetDeadline(t time.Time) error {
-	fmt.Printf("streamConn.SetDeadline server=%v: %v\n", c.server, t)
-	err := c.stream.SetDeadline(t)
-	fmt.Printf("streamConn.SetDeadline server=%v err: %v\n", c.server, err)
-	return err
-}
-
-func (c *streamConn) SetReadDeadline(t time.Time) error {
-	fmt.Printf("streamConn.SetReadDeadline server=%v: %v\n", c.server, t)
-	err := c.stream.SetReadDeadline(t)
-	fmt.Printf("streamConn.SetReadDeadline server=%v err: %v\n", c.server, err)
-	return err
-}
-
-func (c *streamConn) SetWriteDeadline(t time.Time) error {
-	fmt.Printf("streamConn.SetWriteDeadline server=%v: %v\n", c.server, t)
-	err := c.stream.SetWriteDeadline(t)
-	fmt.Printf("streamConn.SetWriteDeadline server=%v err: %v\n", c.server, err)
-	return err
-}
+func (c *streamConn) LocalAddr() net.Addr                { return &net.TCPAddr{IP: net.IPv4(0, 0, 0, 0), Port: 0} }
+func (c *streamConn) RemoteAddr() net.Addr               { return &net.TCPAddr{IP: net.IPv4(0, 0, 0, 0), Port: 0} }
+func (c *streamConn) SetDeadline(t time.Time) error      { return nil }
+func (c *streamConn) SetReadDeadline(t time.Time) error  { return nil }
+func (c *streamConn) SetWriteDeadline(t time.Time) error { return nil }
 
 func quicConnDial(conn quic.Connection) func(ctx context.Context, network string, addr string) (net.Conn, error) {
 	return func(ctx context.Context, network, addr string) (net.Conn, error) {
@@ -126,7 +66,7 @@ func quicConnDial(conn quic.Connection) func(ctx context.Context, network string
 		if err := writeAddrToStream(stream, netip.AddrPortFrom(netip.AddrFrom4([4]byte{0, 0, 0, 0}), 0)); err != nil {
 			return nil, fmt.Errorf("quicConnDial: writing addr to stream: %w", err)
 		}
-		return &streamConn{stream: stream}, nil
+		return &streamConn{stream: stream, ReadWriteCloser: stream}, nil
 	}
 }
 

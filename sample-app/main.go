@@ -13,7 +13,7 @@ func main() {
 	fmt.Println("Running on addr: ", addr)
 	start := time.Now()
 	log.Panicln(http.ListenAndServe(addr, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		_, hostname := os.Hostname()
+		hostname, _ := os.Hostname()
 		_, _ = fmt.Fprintf(w, "%s - %s", hostname, time.Since(start))
 	})))
 }
