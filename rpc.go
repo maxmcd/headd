@@ -1,6 +1,7 @@
 package tunneld
 
 import (
+	"bytes"
 	"fmt"
 	"io"
 	"log/slog"
@@ -58,6 +59,7 @@ type RPCApp struct {
 	app  App
 	port int
 	cmd  *exec.Cmd
+	logs *bytes.Buffer
 }
 
 func (s *RPCServer) Listen(stream io.ReadWriteCloser) error {
@@ -71,14 +73,6 @@ func (s *RPCServer) Listen(stream io.ReadWriteCloser) error {
 func (s *RPCServer) Hello(req int, resp *int) error {
 	*resp = 1
 	return nil
-}
-
-type RegisterAppReq struct {
-	App App
-}
-
-type RegisterAppResp struct {
-	Port int
 }
 
 func (s *RPCServer) RegisterApp(req RegisterAppReq, resp *RegisterAppResp) error {
@@ -110,6 +104,14 @@ func (s *RPCServer) RegisterApp(req RegisterAppReq, resp *RegisterAppResp) error
 		app:  req.App,
 	})
 	*resp = RegisterAppResp{Port: port}
+	return nil
+}
+
+func (s *RPCServer) Shutown() error {
+	s.apps.Range(func(k string, v *RPCApp) bool {
+		_ = v.cmd.Process.Kill()
+		return true
+	})
 	return nil
 }
 

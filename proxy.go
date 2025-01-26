@@ -20,7 +20,7 @@ import (
 
 type ProxyServer struct {
 	clients   synctyped.Map[*ConnectedClient]
-	appHosts  synctyped.Map[AppPort]
+	appHosts  synctyped.Map[*AppPort]
 	tlsConfig *tls.Config
 }
 
@@ -50,7 +50,7 @@ func NewProxyServer() *ProxyServer {
 
 	return &ProxyServer{
 		clients:  synctyped.Map[*ConnectedClient]{},
-		appHosts: synctyped.Map[AppPort]{},
+		appHosts: synctyped.Map[*AppPort]{},
 		tlsConfig: &tls.Config{
 			InsecureSkipVerify: true,
 			Certificates:       []tls.Certificate{tlsCert},
@@ -60,7 +60,7 @@ func NewProxyServer() *ProxyServer {
 
 type ConnectedClient struct {
 	conn   quic.Connection
-	client *RPCClient
+	client *RPC2Client
 }
 
 func (p *ProxyServer) ListenAddr(ctx context.Context, clientAddr string, publicAddr string) (*RunningServer, error) {
@@ -103,14 +103,10 @@ func (p *ProxyServer) ClientListen(ctx context.Context, conn net.PacketConn) err
 			return fmt.Errorf("accepting quic connection failed: %w", err)
 		}
 		fmt.Println("accepted quic connection")
-		controlStream, err := conn.OpenStreamSync(context.Background())
-		if err != nil {
-			return fmt.Errorf("accepting control stream failed: %w", err)
-		}
 		connName := conn.RemoteAddr().String()
 		connClient := &ConnectedClient{
 			conn:   conn,
-			client: NewRPCClient(controlStream),
+			client: NewRPC2Client(quicConnDial(conn)),
 		}
 		fmt.Println("new conn", connName)
 		_, loaded := p.clients.LoadOrStore(connName, connClient)
@@ -147,12 +143,12 @@ func (p *ProxyServer) PublicListen(ctx context.Context, listener net.Listener) e
 	}
 }
 
-func (p *ProxyServer) RegisterApp(app App) (AppPort, error) {
+func (p *ProxyServer) RegisterApp(app App) (*AppPort, error) {
 	c := p.firstClient()
 
 	appPort, err := c.client.RegisterApp(app)
 	if err != nil {
-		return AppPort{}, fmt.Errorf("client.RegisterApp: %w", err)
+		return nil, fmt.Errorf("client.RegisterApp: %w", err)
 	}
 	slog.Debug("registered new app",
 		"conn", c.conn.RemoteAddr().String(),
@@ -197,7 +193,19 @@ func (p *ProxyServer) handleConn(ctx context.Context, publicConn net.Conn) error
 	defer stream.Close()
 
 	appAddr := netip.AddrPortFrom(netip.AddrFrom4([4]byte{127, 0, 0, 1}), uint16(app.Port))
-	b, err := appAddr.MarshalBinary()
+	if err := writeAddrToStream(stream, appAddr); err != nil {
+		return fmt.Errorf("writing addr to stream: %w", err)
+	}
+
+	closer := make(chan error, 2)
+	go copy(closer, sniConn, stream)
+	go copy(closer, stream, sniConn)
+	<-closer
+	return nil
+}
+
+func writeAddrToStream(stream quic.Stream, addrPort netip.AddrPort) (err error) {
+	b, err := addrPort.MarshalBinary()
 	if err != nil {
 		return fmt.Errorf("marshalling app addr: %w", err)
 	}
@@ -206,7 +214,7 @@ func (p *ProxyServer) handleConn(ctx context.Context, publicConn net.Conn) error
 	if n, err := stream.Write(b); err != nil {
 		return fmt.Errorf("writing to stream: %w", err)
 	} else if n < len(b) {
-		return fmt.Errorf("failed to write all addr bytes to stream: %s", appAddr)
+		return fmt.Errorf("failed to write all addr bytes to stream: %s", addrPort)
 	}
 
 	var errLen uint16
@@ -220,25 +228,31 @@ func (p *ProxyServer) handleConn(ctx context.Context, publicConn net.Conn) error
 		}
 		return errors.New(string(errB))
 	}
-
-	closer := make(chan error, 2)
-	go copy(closer, sniConn, stream)
-	go copy(closer, stream, sniConn)
-	<-closer
 	return nil
 }
 
 type ProxyClient struct {
-	rpcServer *RPCServer
+	rpcServer  *RPC2Server
+	rpcStreams chan quic.Stream
 }
 
-func NewProxyClient() *ProxyClient {
-	return &ProxyClient{
-		rpcServer: NewRPCServer(),
+func NewProxyClient() (*ProxyClient, error) {
+	rpcStreams := make(chan quic.Stream, 2)
+	rpcServer, err := NewRPC2Server(&streamChanListener{streams: rpcStreams})
+	if err != nil {
+		return nil, err
 	}
+	return &ProxyClient{
+		rpcServer:  rpcServer,
+		rpcStreams: rpcStreams,
+	}, nil
 }
 
-func (p *ProxyClient) parseAndDialAddr(ctx context.Context, stream quic.Stream) (net.Conn, error) {
+func (p *ProxyClient) Shutown() error {
+	return p.rpcServer.listener.Close()
+}
+
+func (p *ProxyClient) parseAddr(ctx context.Context, stream quic.Stream) (*netip.AddrPort, error) {
 	lenB := make([]byte, 1)
 	if _, err := stream.Read(lenB); err != nil {
 		return nil, fmt.Errorf("reading len byte: %w", err)
@@ -251,18 +265,27 @@ func (p *ProxyClient) parseAndDialAddr(ctx context.Context, stream quic.Stream) 
 	if err := ap.UnmarshalBinary(addrB); err != nil {
 		return nil, fmt.Errorf("unmarshaling addr: %w", err)
 	}
-	slog.Debug("dialing local app", "addr", ap)
-	conn, err := net.Dial("tcp", ap.String())
-	if err != nil {
-		return nil, fmt.Errorf("dialing tcp failed: %w", err)
-	}
-	return conn, nil
+	return ap, nil
 }
 
 func (p *ProxyClient) handleStreamProxy(ctx context.Context, stream quic.Stream) error {
 	defer stream.Close()
 	fmt.Println("parse and dial addr")
-	conn, err := p.parseAndDialAddr(ctx, stream)
+	addr, err := p.parseAddr(ctx, stream)
+	if err != nil {
+		return err
+	}
+	if addr.Port() == 0 && addr.Addr() == netip.AddrFrom4([4]byte{0, 0, 0, 0}) {
+		fmt.Println("sending rpc stream")
+		_ = binary.Write(stream, binary.BigEndian, uint16(0))
+		p.rpcStreams <- stream
+		return nil
+	}
+	slog.Debug("dialing local app", "addr", addr)
+	conn, err := net.Dial("tcp", addr.String())
+	if err != nil {
+		return fmt.Errorf("dialing tcp failed: %w", err)
+	}
 	if err != nil {
 		fmt.Println("Client dial err", err)
 		errBytes := []byte(err.Error())
@@ -314,19 +337,12 @@ func (p *ProxyClient) Dial(ctx context.Context, addr string) error {
 		return fmt.Errorf("quic dialAddr failed: %w", err)
 	}
 	ctx, cancel := context.WithCancel(context.Background())
-	controlStream, err := conn.AcceptStream(ctx)
-	if err != nil {
-		cancel()
-		return fmt.Errorf("accepting stream failed: %w", err)
-	}
 	go func() {
-		defer controlStream.Close()
-		if err := p.rpcServer.Listen(controlStream); err != nil {
+		if err := p.rpcServer.ListenAndServe(); err != nil {
 			cancel()
 			fmt.Printf("starting server failed: %v\n", err)
 		}
 	}()
-
 	for {
 		stream, err := conn.AcceptStream(ctx)
 		if err != nil {

@@ -9,15 +9,19 @@ import (
 	"os"
 )
 
-var APIRoot = "https://maxm-tunneld.web.val.run"
-
 type APIClient struct {
-	c *http.Client
+	c      *http.Client
+	apiURL string
 }
 
 func NewAPIClient() *APIClient {
+	return NewAPIClientWithURL("https://maxm-tunneld.web.val.run")
+}
+
+func NewAPIClientWithURL(apiURL string) *APIClient {
 	return &APIClient{
-		c: &http.Client{},
+		c:      &http.Client{},
+		apiURL: apiURL,
 	}
 }
 
@@ -47,7 +51,7 @@ func (c *APIClient) CLILogin() (*CLILoginResponse, error) {
 	if err := json.NewEncoder(&buf).Encode(cliLoginRequest{Hostname: hostname}); err != nil {
 		return nil, fmt.Errorf("error encoding cli-login body: %w", err)
 	}
-	r, err := c.c.Post(APIRoot+"/cli/login", "application/json", &buf)
+	r, err := c.c.Post(c.apiURL+"/cli/login", "application/json", &buf)
 	if err != nil {
 		return nil, fmt.Errorf("error making cli-login request: %w", err)
 	}

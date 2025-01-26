@@ -41,12 +41,16 @@ func TestProxy(t *testing.T) {
 	_, _ = clientAddr, publicAddr
 	time.Sleep(time.Millisecond * 100)
 	fmt.Println("new proxy client")
-	proxyClient := tunneld.NewProxyClient()
+	proxyClient, err := tunneld.NewProxyClient()
+	if err != nil {
+		t.Fatal(err)
+	}
 	go func() {
 		if err := proxyClient.Dial(context.Background(), clientAddr); err != nil {
 			panic(err)
 		}
 	}()
+	defer func() { _ = proxyClient.Shutown() }()
 	time.Sleep(time.Second)
 
 	appPort, err := proxy.RegisterApp(tunneld.App{
