@@ -1,4 +1,4 @@
-module github.com/maxmcd/tunneld
+module github.com/maxmcd/headd
 
 go 1.23.3
 

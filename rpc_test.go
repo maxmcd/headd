@@ -1,4 +1,4 @@
-package tunneld
+package headd
 
 import (
 	"context"
@@ -12,7 +12,6 @@ func TestRPC2(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	listener = NewLoggingListener(listener)
 
 	server, err := NewRPC2Server(listener)
 	if err != nil {

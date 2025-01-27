@@ -1,4 +1,4 @@
-package tunneld_test
+package headd_test
 
 import (
 	"context"
@@ -10,38 +10,63 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
-	"github.com/maxmcd/tunneld"
+	"github.com/maxmcd/headd"
 )
+
+type testServer struct {
+	*headd.Server
+	cConn     *net.UDPConn
+	pListener net.Listener
+}
+
+func newTestServer(t *testing.T) *testServer {
+	cAddr, err := net.ResolveUDPAddr("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	cConn, err := net.ListenUDP("udp", cAddr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pListener, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := headd.NewServer(&headd.ServerConfig{
+		HealthCheckPeriod: time.Millisecond * 50,
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	go func() {
+		if err := server.Serve(ctx, cConn, pListener); err != nil {
+			if err != context.Canceled {
+				log.Panicln(err)
+			}
+		}
+	}()
+	return &testServer{
+		Server:    server,
+		cConn:     cConn,
+		pListener: pListener,
+	}
+}
 
 func TestProxy(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{
 		Level: slog.LevelDebug,
 	}))
 	slog.SetDefault(logger)
-	ctx := context.Background()
-	proxy := tunneld.NewProxyServer()
-	server, err := proxy.ListenAddr(ctx, "127.0.0.1:0", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
 
-	clientAddr := server.ClientAddr().String()
-	publicAddr := server.PublicAddr().String()
-
-	go func() {
-		if err := server.Wait(); err != nil {
-			panic(err)
-		}
-	}()
-
-	fmt.Println(clientAddr, publicAddr)
-	_, _ = clientAddr, publicAddr
+	server := newTestServer(t)
+	clientAddr := server.cConn.LocalAddr().String()
+	publicAddr := server.pListener.Addr().String()
 	time.Sleep(time.Millisecond * 100)
 	fmt.Println("new proxy client")
-	proxyClient, err := tunneld.NewProxyClient()
+	proxyClient, err := headd.NewProxyClient()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -53,7 +78,7 @@ func TestProxy(t *testing.T) {
 	defer func() { _ = proxyClient.Shutown() }()
 	time.Sleep(time.Second)
 
-	appPort, err := proxy.RegisterApp(tunneld.App{
+	appPort, err := server.RegisterApp(headd.App{
 		Command: "go",
 		Args:    []string{"run", "./sample-app/main.go"},
 		Name:    "sample-app",
@@ -102,8 +127,8 @@ func TestProxy(t *testing.T) {
 		t.Fatal(err)
 	}
 	fmt.Printf("body: %q", string(body))
-	if string(body) != "hello\n" {
-		t.Fatal("body is not hello")
+	if !strings.Contains(string(body), "uptime") {
+		t.Fatal("body does not contain uptime")
 	}
 
 }

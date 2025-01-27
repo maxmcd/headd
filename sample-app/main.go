@@ -14,6 +14,6 @@ func main() {
 	start := time.Now()
 	log.Panicln(http.ListenAndServe(addr, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		hostname, _ := os.Hostname()
-		_, _ = fmt.Fprintf(w, "%s - %s", hostname, time.Since(start))
+		_, _ = fmt.Fprintf(w, "hostname=%s uptime=%s", hostname, time.Since(start))
 	})))
 }

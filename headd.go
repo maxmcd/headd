@@ -1,4 +1,4 @@
-package tunneld
+package headd
 
 import (
 	"context"
@@ -11,46 +11,66 @@ import (
 	"log/slog"
 	"net"
 	"net/netip"
+	"sync"
 	"time"
 
-	"github.com/maxmcd/tunneld/pkg/synctyped"
 	"github.com/quic-go/quic-go"
 	"golang.org/x/sync/errgroup"
 )
 
-type ProxyServer struct {
-	clients   synctyped.Map[*ConnectedClient]
-	appHosts  synctyped.Map[*AppPort]
-	tlsConfig *tls.Config
+type Server struct {
+	clientsMu  sync.RWMutex
+	clients    map[string]*ConnectedClient
+	appHostsMu sync.RWMutex
+	appHosts   map[string]*serverApp
+	tlsConfig  *tls.Config
+	cfg        *ServerConfig
 }
 
-type RunningServer struct {
-	eg        *errgroup.Group
-	cConn     net.PacketConn
-	pListener net.Listener
+type serverApp struct {
+	appPort AppPort
+	healthy bool
+	client  string
+	cancel  func()
 }
 
-func (r *RunningServer) Wait() error {
-	return r.eg.Wait()
+type App struct {
+	Name string
+
+	Command string
+	Args    []string
+
+	Count int
 }
 
-func (r *RunningServer) ClientAddr() net.Addr {
-	return r.cConn.LocalAddr()
+type AppPort struct {
+	App  App
+	Port int
 }
 
-func (r *RunningServer) PublicAddr() net.Addr {
-	return r.pListener.Addr()
+type ServerConfig struct {
+	HealthCheckPeriod time.Duration
 }
 
-func NewProxyServer() *ProxyServer {
+func NewServer(cfg *ServerConfig) *Server {
+	if cfg == nil {
+		cfg = &ServerConfig{
+			HealthCheckPeriod: time.Second,
+		}
+	}
+	if cfg.HealthCheckPeriod == 0 {
+		cfg.HealthCheckPeriod = time.Second
+	}
+
 	tlsCert, err := tls.LoadX509KeyPair("server.crt", "server.key")
 	if err != nil {
 		log.Panicln(fmt.Errorf("loading certificates: %w", err))
 	}
 
-	return &ProxyServer{
-		clients:  synctyped.Map[*ConnectedClient]{},
-		appHosts: synctyped.Map[*AppPort]{},
+	return &Server{
+		cfg:      cfg,
+		clients:  make(map[string]*ConnectedClient),
+		appHosts: make(map[string]*serverApp),
 		tlsConfig: &tls.Config{
 			InsecureSkipVerify: true,
 			Certificates:       []tls.Certificate{tlsCert},
@@ -63,31 +83,30 @@ type ConnectedClient struct {
 	client *RPC2Client
 }
 
-func (p *ProxyServer) ListenAddr(ctx context.Context, clientAddr string, publicAddr string) (*RunningServer, error) {
+func (p *Server) ListenAndServe(ctx context.Context, clientAddr string, publicAddr string) error {
 	cAddr, err := net.ResolveUDPAddr("udp", clientAddr)
 	if err != nil {
-		return nil, fmt.Errorf("resolving clientAddr: %w", err)
+		return fmt.Errorf("resolving clientAddr: %w", err)
 	}
 	cConn, err := net.ListenUDP("udp", cAddr)
 	if err != nil {
-		return nil, fmt.Errorf("listening on clientAddr: %w", err)
+		return fmt.Errorf("listening on clientAddr: %w", err)
 	}
 	pListener, err := net.Listen("tcp4", publicAddr)
 	if err != nil {
-		return nil, fmt.Errorf("listening on publicAddr: %w", err)
+		return fmt.Errorf("listening on publicAddr: %w", err)
 	}
-
-	eg, ctx := errgroup.WithContext(ctx)
-	eg.Go(func() error { return p.ClientListen(ctx, cConn) })
-	eg.Go(func() error { return p.PublicListen(ctx, pListener) })
-	return &RunningServer{
-		eg:        eg,
-		cConn:     cConn,
-		pListener: pListener,
-	}, nil
+	return p.Serve(ctx, cConn, pListener)
 }
 
-func (p *ProxyServer) ClientListen(ctx context.Context, conn net.PacketConn) error {
+func (p *Server) Serve(ctx context.Context, clientConn *net.UDPConn, publicListener net.Listener) error {
+	eg, ctx := errgroup.WithContext(ctx)
+	eg.Go(func() error { return p.ClientListen(ctx, clientConn) })
+	eg.Go(func() error { return p.PublicListen(ctx, publicListener) })
+	return eg.Wait()
+}
+
+func (p *Server) ClientListen(ctx context.Context, conn net.PacketConn) error {
 	listener, err := quic.Listen(conn, p.tlsConfig, &quic.Config{
 		MaxIdleTimeout:  20 * time.Second,
 		KeepAlivePeriod: 10 * time.Second,
@@ -102,24 +121,27 @@ func (p *ProxyServer) ClientListen(ctx context.Context, conn net.PacketConn) err
 		if err != nil {
 			return fmt.Errorf("accepting quic connection failed: %w", err)
 		}
-		fmt.Println("accepted quic connection")
 		connName := conn.RemoteAddr().String()
 		connClient := &ConnectedClient{
 			conn:   conn,
 			client: NewRPC2Client(quicConnDial(conn)),
 		}
-		fmt.Println("new conn", connName)
-		_, loaded := p.clients.LoadOrStore(connName, connClient)
-		if loaded {
+
+		p.clientsMu.Lock()
+		if _, exists := p.clients[connName]; exists {
+			p.clientsMu.Unlock()
 			return fmt.Errorf("conflicting client name %q", connName)
 		}
+		p.clients[connName] = connClient
+		p.clientsMu.Unlock()
+
 		if err := connClient.client.Hello(); err != nil {
 			return fmt.Errorf("hello failed: %w", err)
 		}
 	}
 }
 
-func (p *ProxyServer) PublicListen(ctx context.Context, listener net.Listener) error {
+func (p *Server) PublicListen(ctx context.Context, listener net.Listener) error {
 	slog.Info("Running public listener", "addr", listener.Addr())
 	go func() {
 		<-ctx.Done()
@@ -142,8 +164,11 @@ func (p *ProxyServer) PublicListen(ctx context.Context, listener net.Listener) e
 	}
 }
 
-func (p *ProxyServer) RegisterApp(app App) (*AppPort, error) {
-	c := p.firstClient()
+func (p *Server) RegisterApp(app App) (*AppPort, error) {
+	name, c := p.firstClient()
+	if c == nil {
+		return nil, fmt.Errorf("no connected clients")
+	}
 
 	appPort, err := c.client.RegisterApp(app)
 	if err != nil {
@@ -152,20 +177,43 @@ func (p *ProxyServer) RegisterApp(app App) (*AppPort, error) {
 	slog.Debug("registered new app",
 		"conn", c.conn.RemoteAddr().String(),
 		"name", app.Name, "port", appPort.Port)
-	p.appHosts.Store(app.Name, appPort)
+	ctx, cancel := context.WithCancel(context.Background())
+	p.appHostsMu.Lock()
+	p.appHosts[app.Name] = &serverApp{
+		appPort: *appPort,
+		client:  name,
+		cancel:  cancel,
+	}
+
+	p.appHostsMu.Unlock()
+	go func() {
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(p.cfg.HealthCheckPeriod):
+				if resp, err := c.client.HealthCheckApp(app.Name); err != nil {
+					slog.Error("health check failed", "err", err)
+				} else if !resp.Healthy {
+					slog.Error("app unhealthy", "name", app.Name)
+				}
+			}
+		}
+	}()
+
 	return appPort, nil
 }
 
-func (p *ProxyServer) firstClient() *ConnectedClient {
-	var out *ConnectedClient
-	p.clients.Range(func(key string, value *ConnectedClient) bool {
-		out = value
-		return false
-	})
-	return out
+func (p *Server) firstClient() (string, *ConnectedClient) {
+	p.clientsMu.RLock()
+	defer p.clientsMu.RUnlock()
+	for name, client := range p.clients {
+		return name, client // Return first client found
+	}
+	return "", nil
 }
 
-func (p *ProxyServer) handleConn(ctx context.Context, publicConn net.Conn) error {
+func (p *Server) handleConn(ctx context.Context, publicConn net.Conn) error {
 	var sni string
 	sniConn := tls.Server(publicConn, &tls.Config{
 		GetConfigForClient: func(hello *tls.ClientHelloInfo) (*tls.Config, error) {
@@ -179,19 +227,22 @@ func (p *ProxyServer) handleConn(ctx context.Context, publicConn net.Conn) error
 		return fmt.Errorf("error handshaking %s %s: %w", publicConn.RemoteAddr(), sni, err)
 	}
 
-	app, ok := p.appHosts.Load(sni)
+	p.appHostsMu.RLock()
+	app, ok := p.appHosts[sni]
+	p.appHostsMu.RUnlock()
+
 	if !ok {
 		return fmt.Errorf("no matching app found for %q", sni)
 	}
 
-	connClient := p.firstClient()
+	_, connClient := p.firstClient()
 	stream, err := connClient.conn.OpenStreamSync(ctx)
 	if err != nil {
 		return fmt.Errorf("opening stream failed: %w", err)
 	}
 	defer stream.Close()
 
-	appAddr := netip.AddrPortFrom(netip.AddrFrom4([4]byte{127, 0, 0, 1}), uint16(app.Port))
+	appAddr := netip.AddrPortFrom(netip.AddrFrom4([4]byte{127, 0, 0, 1}), uint16(app.appPort.Port))
 	if err := writeAddrToStream(stream, appAddr); err != nil {
 		return fmt.Errorf("writing addr to stream: %w", err)
 	}
@@ -317,7 +368,6 @@ func (p *ProxyClient) Dial(ctx context.Context, addr string) error {
 		panic(err)
 	}
 
-	fmt.Println("Dialing quic", addr)
 	conn, err := quic.DialAddr(ctx,
 		addr,
 		&tls.Config{
