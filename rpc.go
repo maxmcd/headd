@@ -47,11 +47,11 @@ type streamConn struct {
 
 type quicChanListener struct {
 	streamChan chan quic.Stream
+	closed     bool
 }
 
 func (l *quicChanListener) Accept() (net.Conn, error) {
 	stream, ok := <-l.streamChan
-	fmt.Println("quicChanListener Accept", stream, ok)
 	if !ok {
 		return nil, io.EOF
 	}
@@ -59,7 +59,10 @@ func (l *quicChanListener) Accept() (net.Conn, error) {
 }
 
 func (l *quicChanListener) Close() error {
-	fmt.Println("closing quic listener")
+	if !l.closed {
+		return nil
+	}
+	l.closed = true
 	close(l.streamChan)
 	return nil
 }
