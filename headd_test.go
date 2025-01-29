@@ -23,6 +23,13 @@ type testServer struct {
 	pListener net.Listener
 }
 
+func init() {
+	var logger = slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{
+		Level: slog.LevelInfo,
+	}))
+	slog.SetDefault(logger)
+}
+
 func newTestServer(t *testing.T) *testServer {
 	cAddr, err := net.ResolveUDPAddr("udp", "127.0.0.1:0")
 	if err != nil {
@@ -56,17 +63,11 @@ func newTestServer(t *testing.T) *testServer {
 }
 
 func TestProxy(t *testing.T) {
-	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{
-		Level: slog.LevelInfo,
-	}))
-	slog.SetDefault(logger)
-
+	ctx := context.Background()
 	server := newTestServer(t)
 	clientAddr := server.cConn.LocalAddr().String()
 	publicAddr := server.pListener.Addr().String()
-	time.Sleep(time.Millisecond * 100)
-	fmt.Println("new proxy client")
-	proxyClient, err := headd.NewProxyClient()
+	proxyClient, err := headd.NewClient()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -75,18 +76,21 @@ func TestProxy(t *testing.T) {
 		t.Fatal(err)
 	}
 	go func() {
-		if err := proxyClient.Listen(clientConn); err != nil {
+		if err := proxyClient.Listen(ctx, clientConn); err != nil {
 			panic(err)
 		}
 	}()
 	defer func() { _ = proxyClient.Shutdown() }()
 
 	for i := 0; i < 10; i++ {
-		apps := server.Clients()
-		if len(apps) > 0 {
+		time.Sleep(time.Millisecond * 5)
+		clients := server.Clients()
+		if len(clients) > 0 {
 			break
 		}
-		time.Sleep(time.Millisecond * 50)
+		if i == 10-1 {
+			t.Fatal("No connected client")
+		}
 	}
 
 	appPort, err := server.RegisterApp(headd.App{
@@ -99,14 +103,15 @@ func TestProxy(t *testing.T) {
 	}
 
 	for i := 0; i < 10; i++ {
+		time.Sleep(time.Millisecond * 50)
 		apps := server.Apps()
 		if len(apps) > 0 && apps[0].Healthy {
 			break
 		}
-		time.Sleep(time.Millisecond * 50)
+		if i == 10-1 {
+			t.Fatal("App never got healthy")
+		}
 	}
-
-	fmt.Println("preparing request")
 
 	req, err := http.NewRequest("GET", fmt.Sprintf("http://%s/", publicAddr), nil)
 	if err != nil {
@@ -119,12 +124,10 @@ func TestProxy(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer resp.Body.Close()
-	fmt.Println("resp", resp)
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		t.Fatal(err)
 	}
-	fmt.Printf("body: %q\n", string(body))
 	if !strings.Contains(string(body), "uptime") {
 		t.Fatal("body does not contain uptime")
 	}

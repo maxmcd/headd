@@ -14,6 +14,7 @@ import (
 	"net/http/httputil"
 	"net/netip"
 	"net/url"
+	"strings"
 	"sync"
 	"time"
 
@@ -134,11 +135,11 @@ func (p *Server) ClientListen(ctx context.Context, conn net.PacketConn) error {
 			return fmt.Errorf("accepting quic connection failed: %w", err)
 		}
 		connName := conn.RemoteAddr().String()
+		slog.Info("New client connection", "name", connName)
 		connClient := &ConnectedClient{
 			conn:   conn,
 			client: NewRPC2Client(quicConnDial(conn)),
 		}
-
 		p.clientsMu.Lock()
 		if _, exists := p.clients[connName]; exists {
 			p.clientsMu.Unlock()
@@ -176,38 +177,41 @@ func (p *Server) PublicListen(ctx context.Context, listener net.Listener) error 
 	}
 }
 
+var ErrAppNotFound = errors.New("app not found")
+
 func (p *Server) PublicListenHTTP(ctx context.Context, listener net.Listener) error {
-	server := &http.Server{
-		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			app, c := p.appClient(r.Host)
-			if c == nil {
-				http.Error(w, "Not Found", http.StatusNotFound)
+	proxy := httputil.ReverseProxy{
+		Transport: &http.Transport{
+			DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+				app, c := p.appClient(strings.TrimSuffix(addr, ":80"))
+				if c == nil {
+					return nil, ErrAppNotFound
+				}
+				stream, err := c.conn.OpenStreamSync(ctx)
+				if err != nil {
+					return nil, fmt.Errorf("conn.OpenStreamSync: %w", err)
+				}
+				appAddr := netip.AddrPortFrom(netip.AddrFrom4([4]byte{127, 0, 0, 1}), uint16(app.appPort.Port))
+				if err := writeAddrToStream(stream, appAddr); err != nil {
+					return nil, fmt.Errorf("writing addr to stream: %w", err)
+				}
+				return &streamConn{stream: stream, ReadWriteCloser: stream}, nil
+			},
+		},
+		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
+			if errors.Is(err, ErrAppNotFound) {
+				http.Error(w, "not found", http.StatusNotFound)
 				return
 			}
-			proxy := httputil.ReverseProxy{
-				Transport: &http.Transport{
-					DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
-						stream, err := c.conn.OpenStreamSync(ctx)
-						if err != nil {
-							return nil, fmt.Errorf("conn.OpenStreamSync: %w", err)
-						}
-						appAddr := netip.AddrPortFrom(netip.AddrFrom4([4]byte{127, 0, 0, 1}), uint16(app.appPort.Port))
-						if err := writeAddrToStream(stream, appAddr); err != nil {
-							return nil, fmt.Errorf("writing addr to stream: %w", err)
-						}
-						return &streamConn{stream: stream, ReadWriteCloser: stream}, nil
-					},
-				},
-				ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
-					panic(err)
-				},
-				Director: func(r *http.Request) {
-					fmt.Println(r.URL.Scheme)
-					fmt.Println(r)
-				},
-			}
+			panic(err)
+		},
+		Director: func(r *http.Request) {},
+	}
+
+	server := &http.Server{
+		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			// TODO: make urls work as expected
-			r.URL, _ = url.Parse("http://headd")
+			r.URL, _ = url.Parse(fmt.Sprintf("http://%s", r.Host))
 			proxy.ServeHTTP(w, r)
 		}),
 	}
@@ -250,7 +254,7 @@ func (p *Server) Apps() (apps []AppInfo) {
 
 func (p *Server) Clients() (clients []ClientInfo) {
 	p.clientsMu.RLock()
-	for name, _ := range p.clients {
+	for name := range p.clients {
 		clients = append(clients, ClientInfo{
 			Name: name,
 		})
@@ -381,24 +385,84 @@ func writeAddrToStream(stream quic.Stream, addrPort netip.AddrPort) (err error) 
 	return nil
 }
 
-type ProxyClient struct {
+func WebHandler(server *Server) http.Handler {
+	mux := http.NewServeMux()
+
+	html := func(body string) string {
+		return fmt.Sprintf(`<html>
+		<style>
+		body {
+			background: black; color: white; font-family: monospace;
+			max-width: 400px; margin: 30px auto 0px auto;
+		}
+		a { color: lightblue; }
+		.error { color: red; padding: 10px; border: 1px dashed red; }
+		</style>
+		<body>%s</body>
+		</html>`, body)
+	}
+
+	httpError := func(w http.ResponseWriter, msg string, code int) {
+		w.WriteHeader(code)
+		w.Header().Add("Content-Type", "text/html")
+		fmt.Fprint(w, html(fmt.Sprintf(`
+		<h3>Headd.</h3>
+		<p><i>uh oh</i></p>
+		<div class=error>%s</div>
+		`, msg)))
+	}
+
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/" {
+			httpError(w, "404 - Not found", http.StatusNotFound)
+			return
+		}
+		w.Header().Add("Content-Type", "text/html")
+		fmt.Fprint(w, html(fmt.Sprintf(`
+		<h3>Headd.</h3>
+		<p>Current apps: %v</p>
+		<p><a href="/">refresh</a></p>
+		<p><form method=post action="/add-app"><button type=submit>Add app</button></form></p>
+
+		`, server.Apps())))
+	})
+	mux.HandleFunc("/add-app", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			httpError(w, "404 - Not found", http.StatusNotFound)
+			return
+		}
+
+		_, err := server.RegisterApp(App{
+			Name:    fmt.Sprintf("app-%d", len(server.Apps())),
+			Command: "./sample-app/sample-app",
+		})
+		if err != nil {
+			httpError(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		http.Redirect(w, r, "/", 302)
+	})
+	return mux
+}
+
+type Client struct {
 	rpcServer  *RPC2Server
 	rpcStreams chan quic.Stream
 }
 
-func NewProxyClient() (*ProxyClient, error) {
+func NewClient() (*Client, error) {
 	rpcStreams := make(chan quic.Stream, 2)
 	rpcServer, err := NewRPC2Server(&quicChanListener{streamChan: rpcStreams})
 	if err != nil {
 		return nil, err
 	}
-	return &ProxyClient{
+	return &Client{
 		rpcServer:  rpcServer,
 		rpcStreams: rpcStreams,
 	}, nil
 }
 
-func (p *ProxyClient) Shutdown() error {
+func (p *Client) Shutdown() error {
 	return p.rpcServer.listener.Close()
 }
 
@@ -418,8 +482,7 @@ func parseAddrFromStream(stream quic.Stream) (*netip.AddrPort, error) {
 	return ap, nil
 }
 
-func (p *ProxyClient) handleStreamProxy(ctx context.Context, stream quic.Stream) error {
-	fmt.Println("parse and dial addr")
+func (p *Client) handleStreamProxy(ctx context.Context, stream quic.Stream) error {
 	addr, err := parseAddrFromStream(stream)
 	if err != nil {
 		_ = stream.Close()
@@ -462,12 +525,12 @@ func (p *ProxyClient) handleStreamProxy(ctx context.Context, stream quic.Stream)
 
 // Dial phones home to the server and sets up the connection to proxy traffic
 // over.
-func (p *ProxyClient) Dial(ctx context.Context, addr string) (quic.Connection, error) {
+func (p *Client) Dial(ctx context.Context, addr string) (quic.Connection, error) {
 	tlsCert, err := tls.LoadX509KeyPair("server.crt", "server.key")
 	if err != nil {
 		return nil, fmt.Errorf("loading tls certs: %w", err)
 	}
-
+	slog.Info("dialing", "addr", addr)
 	conn, err := quic.DialAddr(ctx,
 		addr,
 		&tls.Config{
@@ -485,8 +548,8 @@ func (p *ProxyClient) Dial(ctx context.Context, addr string) (quic.Connection, e
 	return conn, nil
 }
 
-func (p *ProxyClient) Listen(conn quic.Connection) error {
-	ctx, cancel := context.WithCancel(context.Background())
+func (p *Client) Listen(ctx context.Context, conn quic.Connection) error {
+	ctx, cancel := context.WithCancel(ctx)
 	go func() {
 		if err := p.rpcServer.ListenAndServe(); err != nil {
 			cancel()
@@ -497,13 +560,19 @@ func (p *ProxyClient) Listen(conn quic.Connection) error {
 		stream, err := conn.AcceptStream(ctx)
 		if err != nil {
 			cancel()
+			if errors.Is(err, context.Canceled) {
+				_ = conn.CloseWithError(quic.ApplicationErrorCode(quic.ConnectionRefused), "connection closed")
+			} else {
+				_ = conn.CloseWithError(quic.ApplicationErrorCode(quic.InternalError), err.Error())
+			}
 			return fmt.Errorf("accepting stream failed: %w", err)
 		}
-		fmt.Println("accepting stream", stream.StreamID())
+		slog.Info("accepting stream", "id", stream.StreamID())
 		go func() {
 			if err := p.handleStreamProxy(ctx, stream); err != nil {
 				slog.Error("handleStreamProxy", "err", err)
 			}
+			slog.Info("stream ended", "id", stream.StreamID())
 		}()
 	}
 

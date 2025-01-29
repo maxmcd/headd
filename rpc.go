@@ -14,6 +14,7 @@ import (
 	"net/netip"
 	"os"
 	"os/exec"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -77,10 +78,15 @@ func (c *streamConn) SetDeadline(t time.Time) error      { return nil }
 func (c *streamConn) SetReadDeadline(t time.Time) error  { return nil }
 func (c *streamConn) SetWriteDeadline(t time.Time) error { return nil }
 
+var ErrConnectionClosed = errors.New("client connection closed")
+
 func quicConnDial(conn quic.Connection) func(ctx context.Context, network string, addr string) (net.Conn, error) {
 	return func(ctx context.Context, network, addr string) (net.Conn, error) {
 		stream, err := conn.OpenStreamSync(ctx)
 		if err != nil {
+			if strings.HasSuffix(err.Error(), "Application error 0x2 (remote): connection closed") {
+				err = ErrConnectionClosed
+			}
 			return nil, fmt.Errorf("quicConnDial openStreamSync: %w", err)
 		}
 		if err := writeAddrToStream(stream, netip.AddrPortFrom(netip.AddrFrom4([4]byte{0, 0, 0, 0}), 0)); err != nil {
@@ -228,7 +234,6 @@ func NewRPC2Client(dialer func(context.Context, string, string) (net.Conn, error
 			AllowHTTP: true, // Enable h2c support
 			DialTLSContext: func(ctx context.Context,
 				network, addr string, cfg *tls.Config) (net.Conn, error) {
-				fmt.Println("dialing", network, addr)
 				return dialer(ctx, network, addr)
 			},
 		},
