@@ -135,6 +135,10 @@ func (p *Server) ClientListen(ctx context.Context, conn net.PacketConn) error {
 			return fmt.Errorf("accepting quic connection failed: %w", err)
 		}
 		connName := conn.RemoteAddr().String()
+		go func() {
+			<-conn.Context().Done()
+			slog.Info("connection closed", "name", connName)
+		}()
 		slog.Info("New client connection", "name", connName)
 		connClient := &ConnectedClient{
 			conn:   conn,
@@ -148,9 +152,12 @@ func (p *Server) ClientListen(ctx context.Context, conn net.PacketConn) error {
 		p.clients[connName] = connClient
 		p.clientsMu.Unlock()
 
+		start := time.Now()
+		fmt.Println("start hello")
 		if err := connClient.client.Hello(); err != nil {
 			return fmt.Errorf("hello failed: %w", err)
 		}
+		fmt.Println("end hello", time.Since(start))
 	}
 }
 
