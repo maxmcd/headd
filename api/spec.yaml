@@ -1,12 +1,15 @@
 openapi: 3.0.0
 info:
-  title: Headd API
+  title: Head API
   version: 1.0.0
-  description: API for managing headd hosts and builds
+  description: API for managing head hosts and builds
 
 paths:
   /hosts:
     get:
+      tags: [hosts]
+      security:
+        - bearerAuth: []
       summary: List available hosts
       responses:
         "200":
@@ -20,6 +23,9 @@ paths:
 
   /hosts/{hostId}/build:
     post:
+      tags: [hosts, builds]
+      security:
+        - bearerAuth: []
       summary: Start a new build
       parameters:
         - name: hostId
@@ -40,13 +46,24 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/Build"
-        "404":
-          description: Host not found
         "400":
           description: Invalid request
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "401":
+          description: Unauthorized
+        "404":
+          description: Host not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
 
   /hosts/{hostId}/build/{buildId}:
     get:
+      tags: [hosts, builds]
       summary: Get build status
       parameters:
         - name: hostId
@@ -70,8 +87,25 @@ paths:
           description: Host or build not found
 
 components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+
   schemas:
+    Error:
+      type: object
+      required:
+        - code
+        - message
+      properties:
+        code:
+          type: string
+        message:
+          type: string
+
     Host:
+      description: Represents a build host in the system
       type: object
       required:
         - id
@@ -86,6 +120,7 @@ components:
           enum: [online, offline]
 
     BuildRequest:
+      description: Request parameters to start a new build
       type: object
       properties:
         command:
@@ -105,6 +140,7 @@ components:
         - args
 
     Build:
+      description: Represents a build job and its status
       type: object
       required:
         - id
@@ -131,3 +167,12 @@ components:
         completedAt:
           type: string
           format: date-time
+        env:
+          type: object
+          additionalProperties:
+            type: string
+        stream:
+          type: boolean
+        exitCode:
+          type: integer
+          description: Process exit code when build completes

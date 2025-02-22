@@ -23,6 +23,10 @@ import (
 	"github.com/oapi-codegen/runtime"
 )
 
+const (
+	BearerAuthScopes = "bearerAuth.Scopes"
+)
+
 // Defines values for BuildStatus.
 const (
 	Completed BuildStatus = "completed"
@@ -37,20 +41,25 @@ const (
 	Online  HostStatus = "online"
 )
 
-// Build defines model for Build.
+// Build Represents a build job and its status
 type Build struct {
-	Args        []string    `json:"args"`
-	Command     string      `json:"command"`
-	CompletedAt time.Time   `json:"completedAt"`
-	CreatedAt   time.Time   `json:"createdAt"`
-	Id          string      `json:"id"`
-	Status      BuildStatus `json:"status"`
+	Args        []string           `json:"args"`
+	Command     string             `json:"command"`
+	CompletedAt time.Time          `json:"completedAt"`
+	CreatedAt   time.Time          `json:"createdAt"`
+	Env         *map[string]string `json:"env,omitempty"`
+
+	// ExitCode Process exit code when build completes
+	ExitCode *int        `json:"exitCode,omitempty"`
+	Id       string      `json:"id"`
+	Status   BuildStatus `json:"status"`
+	Stream   *bool       `json:"stream,omitempty"`
 }
 
 // BuildStatus defines model for Build.Status.
 type BuildStatus string
 
-// BuildRequest defines model for BuildRequest.
+// BuildRequest Request parameters to start a new build
 type BuildRequest struct {
 	Args    []string           `json:"args"`
 	Command string             `json:"command"`
@@ -58,7 +67,13 @@ type BuildRequest struct {
 	Stream  *bool              `json:"stream,omitempty"`
 }
 
-// Host defines model for Host.
+// Error defines model for Error.
+type Error struct {
+	Code    string `json:"code"`
+	Message string `json:"message"`
+}
+
+// Host Represents a build host in the system
 type Host struct {
 	Id     string      `json:"id"`
 	Name   string      `json:"name"`
@@ -400,6 +415,8 @@ type PostHostsHostIdBuildResponse struct {
 	Body         []byte
 	HTTPResponse *http.Response
 	JSON201      *Build
+	JSON400      *Error
+	JSON404      *Error
 }
 
 // Status returns HTTPResponse.Status
@@ -522,6 +539,20 @@ func ParsePostHostsHostIdBuildResponse(rsp *http.Response) (*PostHostsHostIdBuil
 		}
 		response.JSON201 = &dest
 
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 400:
+		var dest Error
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON400 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 404:
+		var dest Error
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON404 = &dest
+
 	}
 
 	return response, nil
@@ -578,6 +609,12 @@ type MiddlewareFunc func(http.Handler) http.Handler
 // GetHosts operation middleware
 func (siw *ServerInterfaceWrapper) GetHosts(w http.ResponseWriter, r *http.Request) {
 
+	ctx := r.Context()
+
+	ctx = context.WithValue(ctx, BearerAuthScopes, []string{})
+
+	r = r.WithContext(ctx)
+
 	handler := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		siw.Handler.GetHosts(w, r)
 	}))
@@ -602,6 +639,12 @@ func (siw *ServerInterfaceWrapper) PostHostsHostIdBuild(w http.ResponseWriter, r
 		siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "hostId", Err: err})
 		return
 	}
+
+	ctx := r.Context()
+
+	ctx = context.WithValue(ctx, BearerAuthScopes, []string{})
+
+	r = r.WithContext(ctx)
 
 	handler := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		siw.Handler.PostHostsHostIdBuild(w, r, hostId)
@@ -778,17 +821,21 @@ func HandlerWithOptions(si ServerInterface, options StdHTTPServerOptions) http.H
 // Base64 encoded, gzipped, json marshaled Swagger object
 var swaggerSpec = []string{
 
-	"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",
+	"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",
+	"AAD//4VrvsreCwAA",
 }
 
 // GetSwagger returns the content of the embedded swagger specification file
