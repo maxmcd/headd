@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -14,8 +15,19 @@ import (
 )
 
 type Build struct {
-	dir string
-	log *os.File
+	// Dir is the directory where the build output will be stored.
+	// If not set, it will be created in the user cache directory.
+	Dir string
+	// ID is the unique identifier for the build.
+	// If not set, it will be generated using the current timestamp.
+	ID string
+	// Tee is used to stream log output.. Logs are streamed in Line-delimited
+	// JSON:
+	//
+	//     {"msg":"+ echo hi","stream":"stderr","ts":"2025-02-22T13:37:02.279744-05:00"}
+	//     {"msg":"+ cat hi.txt","stream":"stderr","ts":"2025-02-22T13:37:02.279942-05:00"}
+	//     {"msg":"hi","stream":"stdout","ts":"2025-02-22T13:37:02.281331-05:00"}
+	Tee io.Writer
 }
 
 type Cmd struct {
@@ -24,18 +36,52 @@ type Cmd struct {
 	Env  []string
 }
 
-func NewBuild(cmd Cmd) (*Build, error) {
-	dir, err := os.MkdirTemp("", "build")
+func getBuildOutputDir(id string) (string, error) {
+	// Get user cache directory
+	cacheDir, err := os.UserCacheDir()
 	if err != nil {
-		return nil, fmt.Errorf("creating build dir: %w", err)
+		return "", fmt.Errorf("failed to get user cache directory: %w", err)
 	}
 
-	f, err := os.Create(filepath.Join(dir, "build.log"))
+	// Create base headd builds directory if it doesn't exist
+	headdBuildsDir := filepath.Join(cacheDir, "headd", "builds")
+	if err := os.MkdirAll(headdBuildsDir, 0755); err != nil {
+		return "", fmt.Errorf("failed to create builds directory: %w", err)
+	}
+
+	// Generate unique build ID using timestamp
+	buildDir := filepath.Join(headdBuildsDir, id)
+
+	// Create the unique build directory
+	if err := os.MkdirAll(buildDir, 0755); err != nil {
+		return "", fmt.Errorf("failed to create build directory: %w", err)
+	}
+
+	return buildDir, nil
+}
+
+func (b *Build) Run(cmd Cmd) error {
+	if b.ID == "" {
+		b.ID = fmt.Sprintf("%d", time.Now().UnixNano())
+	}
+	if b.Dir == "" {
+		dir, err := getBuildOutputDir(b.ID)
+		if err != nil {
+			return fmt.Errorf("failed to get build output directory: %w", err)
+		}
+		b.Dir = dir
+	}
+
+	f, err := os.Create(filepath.Join(b.Dir, "build.log"))
 	if err != nil {
-		return nil, fmt.Errorf("creating build log file: %w", err)
+		return fmt.Errorf("creating build log file: %w", err)
 	}
 	defer f.Close()
-	writer := bufio.NewWriter(f)
+	var w io.Writer = f
+	if b.Tee != nil {
+		w = io.MultiWriter(w, b.Tee)
+	}
+	writer := bufio.NewWriter(w)
 	defer writer.Flush()
 	encoder := json.NewEncoder(writer)
 	lock := sync.Mutex{}
@@ -55,12 +101,13 @@ func NewBuild(cmd Cmd) (*Build, error) {
 
 	c := exec.Command(cmd.Cmd, cmd.Args...)
 	c.Env = append(os.Environ(), cmd.Env...)
+	c.Dir = b.Dir
 	c.Stdout = stdoutWriter
 	c.Stderr = stderrWriter
 
 	if err := c.Run(); err != nil {
-		return nil, fmt.Errorf("running command: %w", err)
+		return fmt.Errorf("running command: %w", err)
 	}
 
-	return &Build{dir: dir, log: f}, nil
+	return nil
 }

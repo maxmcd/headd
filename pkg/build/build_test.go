@@ -1,25 +1,26 @@
 package build
 
 import (
-	"io"
+	"fmt"
 	"os"
 	"testing"
 )
 
 func TestNewBuild(t *testing.T) {
-	build, err := NewBuild(Cmd{
-		Cmd:  "cat",
-		Args: []string{"./build.go"},
-	})
-	if err != nil {
-		t.Fatalf("NewBuild() error = %v", err)
+	build := &Build{
+		Tee: os.Stdout,
+	}
+	if err := build.Run(Cmd{
+		Cmd: "bash",
+		Args: []string{"-c", `
+		set -ex
+		echo hi > hi.txt
+		cat hi.txt
+		`},
+	}); err != nil {
+		t.Fatalf("build.Run() error = %v", err)
 	}
 
-	f, err := os.Open(build.log.Name())
-	if err != nil {
-		t.Fatalf("opening log file: %v", err)
-	}
-	defer f.Close()
+	fmt.Println(build.Dir)
 
-	_, _ = io.Copy(os.Stdout, f)
 }

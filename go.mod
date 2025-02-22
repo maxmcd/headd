@@ -1,6 +1,6 @@
 module github.com/maxmcd/headd
 
-go 1.23.3
+go 1.24.0
 
 require (
 	github.com/quic-go/quic-go v0.43.0
