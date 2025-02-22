@@ -1,0 +1,133 @@
+openapi: 3.0.0
+info:
+  title: Headd API
+  version: 1.0.0
+  description: API for managing headd hosts and builds
+
+paths:
+  /hosts:
+    get:
+      summary: List available hosts
+      responses:
+        "200":
+          description: List of hosts
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/Host"
+
+  /hosts/{hostId}/build:
+    post:
+      summary: Start a new build
+      parameters:
+        - name: hostId
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/BuildRequest"
+      responses:
+        "201":
+          description: Build started
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Build"
+        "404":
+          description: Host not found
+        "400":
+          description: Invalid request
+
+  /hosts/{hostId}/build/{buildId}:
+    get:
+      summary: Get build status
+      parameters:
+        - name: hostId
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: buildId
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Build status
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Build"
+        "404":
+          description: Host or build not found
+
+components:
+  schemas:
+    Host:
+      type: object
+      required:
+        - id
+        - name
+      properties:
+        id:
+          type: string
+        name:
+          type: string
+        status:
+          type: string
+          enum: [online, offline]
+
+    BuildRequest:
+      type: object
+      properties:
+        command:
+          type: string
+        args:
+          type: array
+          items:
+            type: string
+        env:
+          type: object
+          additionalProperties:
+            type: string
+        stream:
+          type: boolean
+      required:
+        - command
+        - args
+
+    Build:
+      type: object
+      required:
+        - id
+        - command
+        - args
+        - status
+        - createdAt
+        - completedAt
+      properties:
+        id:
+          type: string
+        command:
+          type: string
+        args:
+          type: array
+          items:
+            type: string
+        status:
+          type: string
+          enum: [pending, running, completed, failed]
+        createdAt:
+          type: string
+          format: date-time
+        completedAt:
+          type: string
+          format: date-time
