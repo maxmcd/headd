@@ -1,41 +1,27 @@
 package api
 
 import (
-	"context"
 	"encoding/json"
 	"net/http"
 )
 
 type Server struct {
-	api API
 }
-
-type API interface {
-	GetHosts(ctx context.Context) ([]Host, error)
-	GetBuild(ctx context.Context, hostId string, buildId string) (*Build, error)
-	CreateBuild(ctx context.Context, hostId string, br BuildRequest) (*Build, error)
-}
-
-var _ ServerInterface = &Server{}
 
 func (s *Server) GetHosts(w http.ResponseWriter, r *http.Request) {
-	hosts, err := s.api.GetHosts(r.Context())
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
 	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(hosts)
+	_ = json.NewEncoder(w).Encode([]Host{
+		{
+			Id: "123",
+		},
+	})
 }
 
 func (s *Server) GetHostsHostIdBuildBuildId(w http.ResponseWriter, r *http.Request, hostId string, buildId string) {
-	build, err := s.api.GetBuild(r.Context(), hostId, buildId)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
 	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(build)
+	_ = json.NewEncoder(w).Encode(Build{
+		Id: "123",
+	})
 }
 
 func (s *Server) PostHostsHostIdBuild(w http.ResponseWriter, r *http.Request, hostId string) {
@@ -45,7 +31,8 @@ func (s *Server) PostHostsHostIdBuild(w http.ResponseWriter, r *http.Request, ho
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	build, err := s.api.CreateBuild(r.Context(), hostId, buildRequest)
 	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(build)
+	_ = json.NewEncoder(w).Encode(Build{
+		Id: "123",
+	})
 }

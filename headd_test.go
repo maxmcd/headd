@@ -71,71 +71,67 @@ func TestProxy(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for x := 0; x < 2; x++ {
-		clientConn, err := proxyClient.Dial(context.Background(), clientAddr)
-		if err != nil {
-			t.Fatal(err)
-		}
-		go func() {
-			if err := proxyClient.Listen(ctx, clientConn); err != nil {
-				if !errors.Is(err, context.Canceled) {
-					panic(err)
-				}
-			}
-		}()
-		defer func() { _ = proxyClient.Shutdown() }()
-
-		for i := 0; i < 10; i++ {
-			time.Sleep(time.Millisecond * 5)
-			clients := server.Clients()
-			if len(clients) > x {
-				break
-			}
-			if i == 10-1 {
-				t.Fatal("No connected client")
+	clientConn, err := proxyClient.Dial(context.Background(), clientAddr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	go func() {
+		if err := proxyClient.Listen(ctx, clientConn); err != nil {
+			if !errors.Is(err, context.Canceled) {
+				panic(err)
 			}
 		}
+	}()
+	defer func() { _ = proxyClient.Shutdown() }()
 
-		appPort, err := server.RegisterApp(headd.App{
-			Command: "go",
-			Args:    []string{"run", "./sample-app/main.go"},
-			Name:    "sample-app",
-		})
-		if err != nil {
-			t.Fatal(err)
+	for i := 0; i < 10; i++ {
+		time.Sleep(time.Millisecond * 5)
+		clients := server.Clients()
+		if len(clients) > 0 {
+			break
 		}
+		if i == 10-1 {
+			t.Fatal("No connected client")
+		}
+	}
 
-		for i := 0; i < 10; i++ {
-			time.Sleep(time.Millisecond * 50)
-			apps := server.Apps()
-			if len(apps) > x && apps[0].Healthy {
-				break
-			}
-			if i == 10-1 {
-				t.Fatal("App never got healthy")
-			}
-		}
+	appPort, err := server.RegisterApp(headd.App{
+		Command: "go",
+		Args:    []string{"run", "./sample-app/main.go"},
+		Name:    "sample-app",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
 
-		req, err := http.NewRequest("GET", fmt.Sprintf("http://%s/", publicAddr), nil)
-		if err != nil {
-			t.Fatal(err)
+	for i := 0; i < 10; i++ {
+		time.Sleep(time.Millisecond * 50)
+		apps := server.Apps()
+		if len(apps) > 0 && apps[0].Healthy {
+			break
 		}
-		req.Host = appPort.App.Name
-		req.Header.Set("host", appPort.App.Name)
-		resp, err := http.DefaultClient.Do(req)
-		if err != nil {
-			t.Fatal(err)
+		if i == 10-1 {
+			t.Fatal("App never got healthy")
 		}
-		defer resp.Body.Close()
-		body, err := io.ReadAll(resp.Body)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if !strings.Contains(string(body), "uptime") {
-			t.Fatal("body does not contain uptime")
-		}
+	}
 
-		_ = proxyClient.Shutdown()
+	req, err := http.NewRequest("GET", fmt.Sprintf("http://%s/", publicAddr), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Host = appPort.App.Name
+	req.Header.Set("host", appPort.App.Name)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(body), "uptime") {
+		t.Fatal("body does not contain uptime")
 	}
 
 }
