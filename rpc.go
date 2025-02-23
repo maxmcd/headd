@@ -332,27 +332,3 @@ func (c *RPC2Client) HealthCheckApp(name string) (resp *HealthCheckAppResp, err 
 	return clientRequest[HealthCheckAppReq, HealthCheckAppResp](
 		c.client, "HealthCheckApp", HealthCheckAppReq{Name: name})
 }
-
-type debugReadWriteCloser struct {
-	wrapped io.ReadWriteCloser
-	prefix  string
-}
-
-func (d *debugReadWriteCloser) Read(p []byte) (n int, err error) {
-	n, err = d.wrapped.Read(p)
-	if n > 0 {
-		slog.Debug(d.prefix+" read",
-			"string", string(p[:n]))
-	}
-	return n, err
-}
-
-func (d *debugReadWriteCloser) Write(p []byte) (n int, err error) {
-	slog.Debug(d.prefix+" write",
-		"string", string(p))
-	return d.wrapped.Write(p)
-}
-
-func (d *debugReadWriteCloser) Close() error {
-	return d.wrapped.Close()
-}
