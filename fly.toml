@@ -6,6 +6,9 @@
 app = 'headd'
 primary_region = 'ewr'
 
+[env]
+GODEBUG = "http2debug=2"
+
 [build]
 
 

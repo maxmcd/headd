@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/quic-go/quic-go"
+	"golang.org/x/net/http2"
 	"golang.org/x/sync/errgroup"
 )
 
@@ -539,7 +540,10 @@ func (p *Client) handleStreamProxy(ctx context.Context, stream quic.Stream) erro
 	if addr.Port() == 0 && addr.Addr() == netip.AddrFrom4([4]byte{0, 0, 0, 0}) {
 		_ = binary.Write(stream, binary.BigEndian, uint16(0))
 		slog.Info("using stream as rpc channel", "stream", stream.StreamID())
-		p.rpcStreams <- stream
+
+		(&http2.Server{}).ServeConn(&streamConn{stream: stream, ReadWriteCloser: stream}, &http2.ServeConnOpts{
+			Handler: p.rpcServer.server.Handler,
+		})
 		// Return early, this is an RPC channel.
 		return nil
 	}

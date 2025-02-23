@@ -56,13 +56,11 @@ func (l *quicChanListener) Accept() (net.Conn, error) {
 	if !ok {
 		return nil, io.EOF
 	}
+
 	slog.Info("accepting stream", "stream", stream.StreamID())
 	return &streamConn{
-		stream: stream,
-		ReadWriteCloser: &debugReadWriteCloser{
-			wrapped: stream,
-			prefix:  fmt.Sprintf("stream-%d", stream.StreamID()),
-		},
+		stream:          stream,
+		ReadWriteCloser: stream,
 	}, nil
 }
 
@@ -101,11 +99,8 @@ func quicConnDial(conn quic.Connection) func(ctx context.Context, network string
 		}
 
 		return &streamConn{
-			stream: stream,
-			ReadWriteCloser: &debugReadWriteCloser{
-				wrapped: stream,
-				prefix:  fmt.Sprintf("stream-%d", stream.StreamID()),
-			},
+			stream:          stream,
+			ReadWriteCloser: stream,
 		}, nil
 	}
 }

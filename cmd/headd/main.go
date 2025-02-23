@@ -51,8 +51,8 @@ func main() {
 		if err != nil {
 			log.Panicln(err)
 		}
-		// conn, err := client.Dial(context.Background(), "149.248.195.13:7400")
-		conn, err := client.Dial(context.Background(), "127.0.0.1:7400")
+		conn, err := client.Dial(context.Background(), "149.248.195.13:7400")
+		// conn, err := client.Dial(context.Background(), "127.0.0.1:7400")
 		if err != nil {
 			fmt.Println("Failed to connect to server: %w", err)
 			os.Exit(1)
