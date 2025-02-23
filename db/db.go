@@ -117,12 +117,12 @@ func New(path string) (*DB, error) {
 		}
 
 		if _, err := tx.Exec(string(content)); err != nil {
-			tx.Rollback()
+			_ = tx.Rollback()
 			return nil, fmt.Errorf("applying migration %s: %w", migration.filename, err)
 		}
 
 		if _, err := tx.Exec("UPDATE migrations SET version = ? WHERE id = 1", migration.version); err != nil {
-			tx.Rollback()
+			_ = tx.Rollback()
 			return nil, fmt.Errorf("updating migration version to %d: %w", migration.version, err)
 		}
 
