@@ -1,0 +1,56 @@
+# fly.toml app configuration file generated for headd on 2025-02-23T10:56:54-05:00
+#
+# See https://fly.io/docs/reference/configuration/ for information about how to use this file.
+#
+
+app = 'headd'
+primary_region = 'ewr'
+
+[build]
+
+
+[[vm]]
+memory = '1gb'
+cpu_kind = 'shared'
+cpus = 1
+
+[[services]]
+internal_port = 7402
+protocol = "tcp"
+auto_stop_machines = "stop"
+auto_start_machines = true
+min_machines_running = 0
+
+[[services.ports]]
+port = 443
+handlers = ["tls", "http"]
+
+[[services.ports]]
+handlers = ["http"]
+port = 80
+force_https = true
+
+
+[[services.http_checks]]
+interval = 10000
+grace_period = "5s"
+method = "get"
+path = "/"
+protocol = "http"
+timeout = 2000
+tls_skip_verify = false
+
+[[services]]
+internal_port = 7401
+protocol = "tcp"
+
+[[services.ports]]
+port = "7401"
+
+
+[[services]]
+internal_port = 7400
+protocol = "udp"
+
+[[services.ports]]
+port = "7400"

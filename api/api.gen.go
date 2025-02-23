@@ -69,7 +69,6 @@ type BuildRequest struct {
 
 // Error defines model for Error.
 type Error struct {
-	Code    string `json:"code"`
 	Message string `json:"message"`
 }
 
@@ -82,6 +81,12 @@ type Host struct {
 
 // HostStatus defines model for Host.Status.
 type HostStatus string
+
+// BadRequestError defines model for BadRequestError.
+type BadRequestError = Error
+
+// NotFoundError defines model for NotFoundError.
+type NotFoundError = Error
 
 // PostHostsHostIdBuildJSONRequestBody defines body for PostHostsHostIdBuild for application/json ContentType.
 type PostHostsHostIdBuildJSONRequestBody = BuildRequest
@@ -415,8 +420,8 @@ type PostHostsHostIdBuildResponse struct {
 	Body         []byte
 	HTTPResponse *http.Response
 	JSON201      *Build
-	JSON400      *Error
-	JSON404      *Error
+	JSON400      *BadRequestError
+	JSON404      *NotFoundError
 }
 
 // Status returns HTTPResponse.Status
@@ -439,6 +444,7 @@ type GetHostsHostIdBuildBuildIdResponse struct {
 	Body         []byte
 	HTTPResponse *http.Response
 	JSON200      *Build
+	JSON404      *NotFoundError
 }
 
 // Status returns HTTPResponse.Status
@@ -540,14 +546,14 @@ func ParsePostHostsHostIdBuildResponse(rsp *http.Response) (*PostHostsHostIdBuil
 		response.JSON201 = &dest
 
 	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 400:
-		var dest Error
+		var dest BadRequestError
 		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
 			return nil, err
 		}
 		response.JSON400 = &dest
 
 	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 404:
-		var dest Error
+		var dest NotFoundError
 		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
 			return nil, err
 		}
@@ -578,6 +584,13 @@ func ParseGetHostsHostIdBuildBuildIdResponse(rsp *http.Response) (*GetHostsHostI
 			return nil, err
 		}
 		response.JSON200 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 404:
+		var dest NotFoundError
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON404 = &dest
 
 	}
 
@@ -821,21 +834,21 @@ func HandlerWithOptions(si ServerInterface, options StdHTTPServerOptions) http.H
 // Base64 encoded, gzipped, json marshaled Swagger object
 var swaggerSpec = []string{
 
-	"H4sIAAAAAAAC/7RWUW/jNgz+KwK3R+/Sbvfkt3YYrgH2ENxhT0UeGIuOVdiST6J7ywL/94GSncS1e7ug",
-	"65MViSKp7/tI5giFa1pnyXKA/AihqKjBuLzvTK1loSkU3rRsnIUcPlPrKYi9QrUTG/XkdgqtVoaDCozc",
-	"Bcig9a4lz4aiM/T7+DVMTVzwoSXIIbA3dg99Nm6g93iQ34VrGrR60VZyrolJ37Gcl843yJCDRqZf2DQE",
-	"2cIlT3jlFbLPMXmtjbwe683kUa+9we2eqODo4G/DvztNcxg33hUUghILVThN6ltFdgB0fF84J2Us0568",
-	"ODXLoAzI50cg2zWQP0JLVsthBr6zNq1O0EEGJZqaNGyzJWeesLmIs3OuJrTQ9xl4+toZT1piGA1nrrLE",
-	"8ymXS9CnrG0XwIqC+0xfOwq8pLt4oFr02BCTD4qdyM2zQmXpW8LunZX3ZkX8MLAvMF0C7A/vnRdX0xcX",
-	"g+BmyTQUAu6XzmaxtdTDaL8U+8EtkzRrDpULrIxVXJEKh8DUzCh6RdAWG/pBpTtbGyspu7KMq7mml3Qb",
-	"I8xfJyGo6LzhwxfphynLHaEnf9dxdWqUkb+4fS7UirmFXnwYW7o5RHebtSqdVw1a3Bu7VxVhQinEJhpR",
-	"i4VvuBaHD3J+t1lDBs/kQ/Jy++Hmw41g4Vqy2BrI4be4lUGLXMWEV9GprPYUuRLMUdJYa8jhE/FDNBBg",
-	"QutsSO/89eYmqcgy2XgP27Y2Rby5egoSfxwUk8L62VMJOfy0Oo+U1TBPVlEus1oTlKbo/GkCK1cmPCZM",
-	"QP445eBx228zCF3ToD+MV/EZTY27mgYPGTBK/T9C+r0VlwmY1VE+a92vduOkawdRT4HauJCQeoj292Ob",
-	"OTWimJqR9AX7UVc5JP9wKTz2HWUX4L0U6TYZU+B7pw9X8fA9+CettZ/WgqTUzzRw+//GXuI6HqQOTlrE",
-	"8fFK5X0vauqNC1HX9hlro5Uf0ZC4t/M6/ctix5Xz5p8xuY/vn5woTFnHqnSd1dfp/8vCKJyKP4Ohubxe",
-	"Batj/Kx1/59946Ia7tOd9yqKbNHR7hT0yvJ6Q697m85laJ2VtMC888PQfCGBE8efiAeL0z+s1ynu+38D",
-	"AAD//4VrvsreCwAA",
+	"H4sIAAAAAAAC/7xWX2/bNhD/KsRtj1qVbn3SWzJsjYFhMNrHwA9n8WQzkEiNPKUzDH334UhZsSxlbeCm",
+	"T6LE+/u7393pCKVrWmfJcoDiCJ5C62yg+HKH+hP901HgP7x3Xj6VzjJZliO2bW1KZONs/hiclW+h3FOD",
+	"cvrZUwUF/JQ/28/TbciTtb7vM9AUSm9aMQIFrOwT1kYrn7xCn8Hfjv90ndU/KIJPFFznS1LWsarEMYjQ",
+	"oBdB6Uyt5XCp2HoK4kSh2oqMenRbhVYrw0EFRu4CZNB615JnkxBGv4tPw9TEAx9aggICe2N3kv/wAb3H",
+	"g7yXrmnQ6kVZSbQmJn0b4amcb5ChAI1Mv7BpCLIFJU/4ShWyTzF4rY1kj/V6ktRLObjtI5WxqPSv4d+d",
+	"pjmMa+9KCkGJhCqdJvVlT3YA9JRfeA7KWKYdeTFqlkEZkC+OQLZroHiAlqyWywx8Z206jdBBBhWamjRs",
+	"siVjnrA587N1ria0kSTCWuNJiw+j4blWWarzGMs56NOqbRbAioQb+nCJd/FCteixISYfFDuhm2eFytKX",
+	"hN0bM+9qRnwzsBeYLgE2joppxg2FgDtaiOfCxUlwyfa9Wy7CrPn3LrAyVvGeVDgEpmZWghcIa7Ghb2Sy",
+	"s7Wx0qKuquJpztklXkYP8+zEBZWdN3z4LPMuRbkl9ORvO96P4zXWJ35+bsQ9c5sGqrGVm0N0u16pynnV",
+	"oMWdsTu1J0wohTgkI2qxsQ3XYvBe7m/XK8jgiXxIVt6/u3l3I1i4liy2Bgr4LX7KoEXex4DzaFROO4q1",
+	"EszjklhpKOAj8X0UyKbL7tebm1etl7Fx/m/PRLrMemm+dv4ygZWrEh6TSkDxMK3Bw6bfZBC6pkF/OKni",
+	"E5oatzUNFjJglP5+gPS+EZMJmPwoj5Xu8+1pk7UDqadArV1ISN1H+bvTGBkHTQzNSPiC/YlXBST7cE48",
+	"9h1lZ+BdknSThCnwndOH77bmJ6Ozn/aChNTPOPD++/peqnW8SBOatJDjQ2LekrExuvzyXyzqffi63vT/",
+	"6VXM+rywRKa0ymBo25f5lR/jY6X7r3bkGc/uks5b0S1bNLQdnb6SuFdMkesYJOvgCiKMlf5IPKyt8Q/l",
+	"5UL3/X8BAAD//yj6a841DAAA",
 }
 
 // GetSwagger returns the content of the embedded swagger specification file

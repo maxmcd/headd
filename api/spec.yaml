@@ -20,7 +20,6 @@ paths:
                 type: array
                 items:
                   $ref: "#/components/schemas/Host"
-
   /hosts/{hostId}/build:
     post:
       tags: [hosts, builds]
@@ -47,19 +46,9 @@ paths:
               schema:
                 $ref: "#/components/schemas/Build"
         "400":
-          description: Invalid request
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/Error"
-        "401":
-          description: Unauthorized
+          $ref: "#/components/responses/BadRequestError"
         "404":
-          description: Host not found
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/Error"
+          $ref: "#/components/responses/NotFoundError"
 
   /hosts/{hostId}/build/{buildId}:
     get:
@@ -84,7 +73,7 @@ paths:
               schema:
                 $ref: "#/components/schemas/Build"
         "404":
-          description: Host or build not found
+          $ref: "#/components/responses/NotFoundError"
 
 components:
   securitySchemes:
@@ -96,11 +85,8 @@ components:
     Error:
       type: object
       required:
-        - code
         - message
       properties:
-        code:
-          type: string
         message:
           type: string
 
@@ -176,3 +162,17 @@ components:
         exitCode:
           type: integer
           description: Process exit code when build completes
+
+  responses:
+    NotFoundError:
+      description: Resource not found
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    BadRequestError:
+      description: Invalid request
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"

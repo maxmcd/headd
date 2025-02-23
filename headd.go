@@ -120,6 +120,34 @@ func (p *Server) Serve(ctx context.Context, clientConn *net.UDPConn, publicListe
 	return eg.Wait()
 }
 
+func (p *Server) handleNewConnection(conn quic.Connection) error {
+	connName := conn.RemoteAddr().String()
+	go func() {
+		<-conn.Context().Done()
+		slog.Info("connection closed", "name", connName)
+	}()
+	slog.Info("New client connection", "name", connName)
+	connClient := &ConnectedClient{
+		conn:   conn,
+		client: NewRPC2Client(quicConnDial(conn)),
+	}
+	p.clientsMu.Lock()
+	if _, exists := p.clients[connName]; exists {
+		p.clientsMu.Unlock()
+		return fmt.Errorf("conflicting client name %q", connName)
+	}
+	p.clients[connName] = connClient
+	p.clientsMu.Unlock()
+
+	start := time.Now()
+	slog.Info("hello", "name", connName)
+	if err := connClient.client.Hello(); err != nil {
+		return fmt.Errorf("hello failed: %w", err)
+	}
+	slog.Info("hello done", "name", connName, "duration", time.Since(start))
+	return nil
+}
+
 func (p *Server) ClientListen(ctx context.Context, conn net.PacketConn) error {
 	listener, err := quic.Listen(conn, p.tlsConfig, &quic.Config{
 		MaxIdleTimeout:  20 * time.Second,
@@ -134,30 +162,11 @@ func (p *Server) ClientListen(ctx context.Context, conn net.PacketConn) error {
 		if err != nil {
 			return fmt.Errorf("accepting quic connection failed: %w", err)
 		}
-		connName := conn.RemoteAddr().String()
 		go func() {
-			<-conn.Context().Done()
-			slog.Info("connection closed", "name", connName)
+			if err := p.handleNewConnection(conn); err != nil {
+				slog.Error("error handling new connection", "err", err)
+			}
 		}()
-		slog.Info("New client connection", "name", connName)
-		connClient := &ConnectedClient{
-			conn:   conn,
-			client: NewRPC2Client(quicConnDial(conn)),
-		}
-		p.clientsMu.Lock()
-		if _, exists := p.clients[connName]; exists {
-			p.clientsMu.Unlock()
-			return fmt.Errorf("conflicting client name %q", connName)
-		}
-		p.clients[connName] = connClient
-		p.clientsMu.Unlock()
-
-		start := time.Now()
-		fmt.Println("start hello")
-		if err := connClient.client.Hello(); err != nil {
-			return fmt.Errorf("hello failed: %w", err)
-		}
-		fmt.Println("end hello", time.Since(start))
 	}
 }
 
@@ -395,6 +404,25 @@ func writeAddrToStream(stream quic.Stream, addrPort netip.AddrPort) (err error) 
 func WebHandler(server *Server) http.Handler {
 	mux := http.NewServeMux()
 
+	// Add logging middleware
+	loggingMiddleware := func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			start := time.Now()
+			sw := &statusWriter{ResponseWriter: w}
+
+			next.ServeHTTP(sw, r)
+
+			slog.Info("http request",
+				"method", r.Method,
+				"path", r.URL.Path,
+				"status", sw.status,
+				"duration", time.Since(start),
+				"remote_addr", r.RemoteAddr,
+				"user_agent", r.UserAgent(),
+			)
+		})
+	}
+
 	html := func(body string) string {
 		return fmt.Sprintf(`<html>
 		<style>
@@ -449,7 +477,20 @@ func WebHandler(server *Server) http.Handler {
 		}
 		http.Redirect(w, r, "/", 302)
 	})
-	return mux
+
+	// Wrap the final mux with the logging middleware
+	return loggingMiddleware(mux)
+}
+
+// statusWriter wraps http.ResponseWriter to capture the status code
+type statusWriter struct {
+	http.ResponseWriter
+	status int
+}
+
+func (w *statusWriter) WriteHeader(status int) {
+	w.status = status
+	w.ResponseWriter.WriteHeader(status)
 }
 
 type Client struct {
@@ -497,6 +538,7 @@ func (p *Client) handleStreamProxy(ctx context.Context, stream quic.Stream) erro
 	}
 	if addr.Port() == 0 && addr.Addr() == netip.AddrFrom4([4]byte{0, 0, 0, 0}) {
 		_ = binary.Write(stream, binary.BigEndian, uint16(0))
+		slog.Info("using stream as rpc channel", "stream", stream.StreamID())
 		p.rpcStreams <- stream
 		// Return early, this is an RPC channel.
 		return nil

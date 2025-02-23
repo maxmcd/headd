@@ -2,48 +2,19 @@ package api
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"testing"
 )
 
-type Server struct {
-}
-
-var _ ServerInterface = &Server{}
-
-func (s *Server) GetHosts(w http.ResponseWriter, r *http.Request) {
-	Hosts := []Host{
-		{
-			Id:   "1",
-			Name: "Host 1",
-		},
-	}
-	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(Hosts)
-}
-
-func (s *Server) GetHostsHostIdBuildBuildId(w http.ResponseWriter, r *http.Request, hostId string, buildId string) {
-	build := Build{
-		Id: "1",
-	}
-	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(build)
-}
-
-func (s *Server) PostHostsHostIdBuild(w http.ResponseWriter, r *http.Request, hostId string) {
-	build := Build{
-		Id: "1",
-	}
-	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(build)
-}
-
 func TestClient(t *testing.T) {
 	server := &Server{}
-	handler := Handler(server)
+	handler := HandlerWithOptions(server, StdHTTPServerOptions{
+		ErrorHandlerFunc: func(w http.ResponseWriter, r *http.Request, err error) {
+
+		},
+	})
 
 	ts := httptest.NewServer(handler)
 	defer ts.Close()

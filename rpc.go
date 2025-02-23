@@ -56,11 +56,18 @@ func (l *quicChanListener) Accept() (net.Conn, error) {
 	if !ok {
 		return nil, io.EOF
 	}
-	return &streamConn{stream: stream, ReadWriteCloser: stream}, nil
+	slog.Info("accepting stream", "stream", stream.StreamID())
+	return &streamConn{
+		stream: stream,
+		ReadWriteCloser: &debugReadWriteCloser{
+			wrapped: stream,
+			prefix:  fmt.Sprintf("stream-%d", stream.StreamID()),
+		},
+	}, nil
 }
 
 func (l *quicChanListener) Close() error {
-	if !l.closed {
+	if l.closed {
 		return nil
 	}
 	l.closed = true
@@ -93,7 +100,13 @@ func quicConnDial(conn quic.Connection) func(ctx context.Context, network string
 			return nil, fmt.Errorf("quicConnDial: writing addr to stream: %w", err)
 		}
 
-		return &streamConn{stream: stream, ReadWriteCloser: stream}, nil
+		return &streamConn{
+			stream: stream,
+			ReadWriteCloser: &debugReadWriteCloser{
+				wrapped: stream,
+				prefix:  fmt.Sprintf("stream-%d", stream.StreamID()),
+			},
+		}, nil
 	}
 }
 
@@ -127,6 +140,7 @@ func NewRPC2Server(listener net.Listener) (*RPC2Server, error) {
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/Hello", func(w http.ResponseWriter, r *http.Request) {
+		slog.Info("Hello", "remote", r.RemoteAddr)
 		_ = json.NewEncoder(w).Encode(1)
 	})
 	handleRPCRequest(mux, "RegisterApp", s.RegisterApp)
@@ -234,7 +248,9 @@ func NewRPC2Client(dialer func(context.Context, string, string) (net.Conn, error
 			AllowHTTP: true, // Enable h2c support
 			DialTLSContext: func(ctx context.Context,
 				network, addr string, cfg *tls.Config) (net.Conn, error) {
-				return dialer(ctx, network, addr)
+				conn, err := dialer(ctx, network, addr)
+				slog.Debug("dialing", "network", network, "addr", addr, "err", err)
+				return conn, err
 			},
 		},
 	}
@@ -275,7 +291,7 @@ func (c *RPC2Client) Hello() error {
 	defer resp.Body.Close()
 	var one int
 	if err := json.NewDecoder(resp.Body).Decode(&one); err != nil {
-		return fmt.Errorf("decoding hello body")
+		return fmt.Errorf("decoding hello body: %w", err)
 	}
 	if one != 1 {
 		return fmt.Errorf("invalid response from hello")
@@ -320,4 +336,28 @@ type HealthCheckAppResp struct {
 func (c *RPC2Client) HealthCheckApp(name string) (resp *HealthCheckAppResp, err error) {
 	return clientRequest[HealthCheckAppReq, HealthCheckAppResp](
 		c.client, "HealthCheckApp", HealthCheckAppReq{Name: name})
+}
+
+type debugReadWriteCloser struct {
+	wrapped io.ReadWriteCloser
+	prefix  string
+}
+
+func (d *debugReadWriteCloser) Read(p []byte) (n int, err error) {
+	n, err = d.wrapped.Read(p)
+	if n > 0 {
+		slog.Debug(d.prefix+" read",
+			"string", string(p[:n]))
+	}
+	return n, err
+}
+
+func (d *debugReadWriteCloser) Write(p []byte) (n int, err error) {
+	slog.Debug(d.prefix+" write",
+		"string", string(p))
+	return d.wrapped.Write(p)
+}
+
+func (d *debugReadWriteCloser) Close() error {
+	return d.wrapped.Close()
 }

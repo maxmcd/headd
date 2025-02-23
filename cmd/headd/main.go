@@ -16,6 +16,26 @@ import (
 )
 
 func main() {
+	_, inFly := os.LookupEnv("FLY_APP_NAME")
+	var listenAddrs struct {
+		Web    string
+		Client string
+		Public string
+	}
+	listenAddrs.Web = "0.0.0.0:7402"
+	if inFly {
+		listenAddrs.Client = "fly-global-services:7400"
+		listenAddrs.Public = "0.0.0.0:7401"
+	} else {
+		listenAddrs.Client = "127.0.0.1:7400"
+		listenAddrs.Public = "127.0.0.1:7401"
+	}
+
+	var logger = slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{
+		Level: slog.LevelDebug,
+	}))
+	slog.SetDefault(logger)
+
 	help := func() {
 		fmt.Println("Headd")
 		fmt.Println("  $ headd server")
@@ -31,6 +51,7 @@ func main() {
 		if err != nil {
 			log.Panicln(err)
 		}
+		// conn, err := client.Dial(context.Background(), "149.248.195.13:7400")
 		conn, err := client.Dial(context.Background(), "127.0.0.1:7400")
 		if err != nil {
 			fmt.Println("Failed to connect to server: %w", err)
@@ -56,9 +77,10 @@ func main() {
 			HealthCheckPeriod: time.Second,
 		})
 		go func() {
-			panic(http.ListenAndServe(":7402", headd.WebHandler(server)))
+			slog.Info("Web interface listening on :7402")
+			panic(http.ListenAndServe(listenAddrs.Web, headd.WebHandler(server)))
 		}()
-		panic(server.ListenAndServe(context.Background(), "127.0.0.1:7400", "127.0.0.1:7401"))
+		panic(server.ListenAndServe(context.Background(), listenAddrs.Client, listenAddrs.Public))
 	}
 	help()
 }
