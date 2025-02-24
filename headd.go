@@ -10,11 +10,16 @@ import (
 	"log"
 	"log/slog"
 	"net"
+	"net/http"
+	"net/http/httputil"
 	"net/netip"
+	"net/url"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/quic-go/quic-go"
+	"golang.org/x/net/http2"
 	"golang.org/x/sync/errgroup"
 )
 
@@ -46,6 +51,16 @@ type App struct {
 type AppPort struct {
 	App  App
 	Port int
+}
+
+type AppInfo struct {
+	Name    string
+	Healthy bool
+	Client  string
+}
+
+type ClientInfo struct {
+	Name string
 }
 
 type ServerConfig struct {
@@ -102,15 +117,42 @@ func (p *Server) ListenAndServe(ctx context.Context, clientAddr string, publicAd
 func (p *Server) Serve(ctx context.Context, clientConn *net.UDPConn, publicListener net.Listener) error {
 	eg, ctx := errgroup.WithContext(ctx)
 	eg.Go(func() error { return p.ClientListen(ctx, clientConn) })
-	eg.Go(func() error { return p.PublicListen(ctx, publicListener) })
+	eg.Go(func() error { return p.PublicListenHTTP(ctx, publicListener) })
 	return eg.Wait()
+}
+
+func (p *Server) handleNewConnection(conn quic.Connection) error {
+	connName := conn.RemoteAddr().String()
+	go func() {
+		<-conn.Context().Done()
+		slog.Info("connection closed", "name", connName)
+	}()
+	slog.Info("New client connection", "name", connName)
+	connClient := &ConnectedClient{
+		conn:   conn,
+		client: NewRPC2Client(quicConnDial(conn)),
+	}
+	p.clientsMu.Lock()
+	if _, exists := p.clients[connName]; exists {
+		p.clientsMu.Unlock()
+		return fmt.Errorf("conflicting client name %q", connName)
+	}
+	p.clients[connName] = connClient
+	p.clientsMu.Unlock()
+
+	start := time.Now()
+	slog.Info("hello", "name", connName)
+	if err := connClient.client.Hello(); err != nil {
+		return fmt.Errorf("hello failed: %w", err)
+	}
+	slog.Info("hello done", "name", connName, "duration", time.Since(start))
+	return nil
 }
 
 func (p *Server) ClientListen(ctx context.Context, conn net.PacketConn) error {
 	listener, err := quic.Listen(conn, p.tlsConfig, &quic.Config{
 		MaxIdleTimeout:  20 * time.Second,
 		KeepAlivePeriod: 10 * time.Second,
-		EnableDatagrams: true,
 	})
 	if err != nil {
 		return fmt.Errorf("listening quic failed: %w", err)
@@ -121,23 +163,11 @@ func (p *Server) ClientListen(ctx context.Context, conn net.PacketConn) error {
 		if err != nil {
 			return fmt.Errorf("accepting quic connection failed: %w", err)
 		}
-		connName := conn.RemoteAddr().String()
-		connClient := &ConnectedClient{
-			conn:   conn,
-			client: NewRPC2Client(quicConnDial(conn)),
-		}
-
-		p.clientsMu.Lock()
-		if _, exists := p.clients[connName]; exists {
-			p.clientsMu.Unlock()
-			return fmt.Errorf("conflicting client name %q", connName)
-		}
-		p.clients[connName] = connClient
-		p.clientsMu.Unlock()
-
-		if err := connClient.client.Hello(); err != nil {
-			return fmt.Errorf("hello failed: %w", err)
-		}
+		go func() {
+			if err := p.handleNewConnection(conn); err != nil {
+				slog.Error("error handling new connection", "err", err)
+			}
+		}()
 	}
 }
 
@@ -162,6 +192,92 @@ func (p *Server) PublicListen(ctx context.Context, listener net.Listener) error 
 			}
 		}()
 	}
+}
+
+var ErrAppNotFound = errors.New("app not found")
+
+func (p *Server) PublicListenHTTP(ctx context.Context, listener net.Listener) error {
+	proxy := httputil.ReverseProxy{
+		Transport: &http.Transport{
+			DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+				app, c := p.appClient(strings.TrimSuffix(addr, ":80"))
+				if c == nil {
+					return nil, ErrAppNotFound
+				}
+				stream, err := c.conn.OpenStreamSync(ctx)
+				if err != nil {
+					return nil, fmt.Errorf("conn.OpenStreamSync: %w", err)
+				}
+				appAddr := netip.AddrPortFrom(netip.AddrFrom4([4]byte{127, 0, 0, 1}), uint16(app.appPort.Port))
+				if err := writeAddrToStream(stream, appAddr); err != nil {
+					return nil, fmt.Errorf("writing addr to stream: %w", err)
+				}
+				return &streamConn{stream: stream, ReadWriteCloser: stream}, nil
+			},
+		},
+		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
+			if errors.Is(err, ErrAppNotFound) {
+				http.Error(w, "not found", http.StatusNotFound)
+				return
+			}
+			panic(err)
+		},
+		Director: func(r *http.Request) {},
+	}
+
+	server := &http.Server{
+		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			// TODO: make urls work as expected
+			r.URL, _ = url.Parse(fmt.Sprintf("http://%s", r.Host))
+			proxy.ServeHTTP(w, r)
+		}),
+	}
+	go func() {
+		<-ctx.Done()
+		_ = server.Close()
+	}()
+	slog.Info("Running public http listener", "addr", listener.Addr())
+	if err := server.Serve(listener); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (p *Server) appClient(name string) (*serverApp, *ConnectedClient) {
+	p.appHostsMu.RLock()
+	app := p.appHosts[name]
+	p.appHostsMu.RUnlock()
+	if app == nil {
+		return nil, nil
+	}
+	p.clientsMu.RLock()
+	c := p.clients[app.client]
+	p.clientsMu.RUnlock()
+	return app, c
+}
+
+func (p *Server) Apps() (apps []AppInfo) {
+	p.appHostsMu.RLock()
+	for name, app := range p.appHosts {
+		apps = append(apps, AppInfo{
+			Client:  app.client,
+			Healthy: app.healthy,
+			Name:    name,
+		})
+	}
+	p.appHostsMu.RUnlock()
+	return apps
+}
+
+func (p *Server) Clients() (clients []ClientInfo) {
+	p.clientsMu.RLock()
+	for name := range p.clients {
+		clients = append(clients, ClientInfo{
+			Name: name,
+		})
+	}
+	p.clientsMu.RUnlock()
+	return clients
 }
 
 func (p *Server) RegisterApp(app App) (*AppPort, error) {
@@ -193,9 +309,14 @@ func (p *Server) RegisterApp(app App) (*AppPort, error) {
 				return
 			case <-time.After(p.cfg.HealthCheckPeriod):
 				if resp, err := c.client.HealthCheckApp(app.Name); err != nil {
-					slog.Error("health check failed", "err", err)
+					slog.Debug("health check failed", "err", err)
 				} else if !resp.Healthy {
-					slog.Error("app unhealthy", "name", app.Name)
+					slog.Debug("app unhealthy", "name", app.Name)
+				} else {
+					p.appHostsMu.Lock()
+					a := p.appHosts[app.Name]
+					a.healthy = true
+					p.appHostsMu.Unlock()
 				}
 			}
 		}
@@ -281,24 +402,116 @@ func writeAddrToStream(stream quic.Stream, addrPort netip.AddrPort) (err error) 
 	return nil
 }
 
-type ProxyClient struct {
+func WebHandler(server *Server) http.Handler {
+	mux := http.NewServeMux()
+
+	// Add logging middleware
+	loggingMiddleware := func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			start := time.Now()
+			sw := &statusWriter{ResponseWriter: w}
+
+			next.ServeHTTP(sw, r)
+
+			slog.Info("http request",
+				"method", r.Method,
+				"path", r.URL.Path,
+				"status", sw.status,
+				"duration", time.Since(start),
+				"remote_addr", r.RemoteAddr,
+				"user_agent", r.UserAgent(),
+			)
+		})
+	}
+
+	html := func(body string) string {
+		return fmt.Sprintf(`<html>
+		<style>
+		body {
+			background: black; color: white; font-family: monospace;
+			max-width: 400px; margin: 30px auto 0px auto;
+		}
+		a { color: lightblue; }
+		.error { color: red; padding: 10px; border: 1px dashed red; }
+		</style>
+		<body>%s</body>
+		</html>`, body)
+	}
+
+	httpError := func(w http.ResponseWriter, msg string, code int) {
+		w.WriteHeader(code)
+		w.Header().Add("Content-Type", "text/html")
+		fmt.Fprint(w, html(fmt.Sprintf(`
+		<h3>Headd.</h3>
+		<p><i>uh oh</i></p>
+		<div class=error>%s</div>
+		`, msg)))
+	}
+
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/" {
+			httpError(w, "404 - Not found", http.StatusNotFound)
+			return
+		}
+		w.Header().Add("Content-Type", "text/html")
+		fmt.Fprint(w, html(fmt.Sprintf(`
+		<h3>Headd.</h3>
+		<p>Current apps: %v</p>
+		<p><a href="/">refresh</a></p>
+		<p><form method=post action="/add-app"><button type=submit>Add app</button></form></p>
+
+		`, server.Apps())))
+	})
+	mux.HandleFunc("/add-app", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			httpError(w, "404 - Not found", http.StatusNotFound)
+			return
+		}
+
+		_, err := server.RegisterApp(App{
+			Name:    fmt.Sprintf("app-%d", len(server.Apps())),
+			Command: "./sample-app/sample-app",
+		})
+		if err != nil {
+			httpError(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		http.Redirect(w, r, "/", 302)
+	})
+
+	// Wrap the final mux with the logging middleware
+	return loggingMiddleware(mux)
+}
+
+// statusWriter wraps http.ResponseWriter to capture the status code
+type statusWriter struct {
+	http.ResponseWriter
+	status int
+}
+
+func (w *statusWriter) WriteHeader(status int) {
+	w.status = status
+	w.ResponseWriter.WriteHeader(status)
+}
+
+type Client struct {
 	rpcServer  *RPC2Server
 	rpcStreams chan quic.Stream
 }
 
-func NewProxyClient() (*ProxyClient, error) {
+func NewClient() (*Client, error) {
 	rpcStreams := make(chan quic.Stream, 2)
 	rpcServer, err := NewRPC2Server(&quicChanListener{streamChan: rpcStreams})
 	if err != nil {
 		return nil, err
 	}
-	return &ProxyClient{
+	return &Client{
 		rpcServer:  rpcServer,
 		rpcStreams: rpcStreams,
 	}, nil
 }
 
-func (p *ProxyClient) Shutown() error {
+func (p *Client) Shutdown() error {
 	return p.rpcServer.listener.Close()
 }
 
@@ -318,8 +531,7 @@ func parseAddrFromStream(stream quic.Stream) (*netip.AddrPort, error) {
 	return ap, nil
 }
 
-func (p *ProxyClient) handleStreamProxy(ctx context.Context, stream quic.Stream) error {
-	fmt.Println("parse and dial addr")
+func (p *Client) handleStreamProxy(ctx context.Context, stream quic.Stream) error {
 	addr, err := parseAddrFromStream(stream)
 	if err != nil {
 		_ = stream.Close()
@@ -327,7 +539,11 @@ func (p *ProxyClient) handleStreamProxy(ctx context.Context, stream quic.Stream)
 	}
 	if addr.Port() == 0 && addr.Addr() == netip.AddrFrom4([4]byte{0, 0, 0, 0}) {
 		_ = binary.Write(stream, binary.BigEndian, uint16(0))
-		p.rpcStreams <- stream
+		slog.Info("using stream as rpc channel", "stream", stream.StreamID())
+
+		(&http2.Server{}).ServeConn(&streamConn{stream: stream, ReadWriteCloser: stream}, &http2.ServeConnOpts{
+			Handler: p.rpcServer.server.Handler,
+		})
 		// Return early, this is an RPC channel.
 		return nil
 	}
@@ -362,12 +578,12 @@ func (p *ProxyClient) handleStreamProxy(ctx context.Context, stream quic.Stream)
 
 // Dial phones home to the server and sets up the connection to proxy traffic
 // over.
-func (p *ProxyClient) Dial(ctx context.Context, addr string) error {
+func (p *Client) Dial(ctx context.Context, addr string) (quic.Connection, error) {
 	tlsCert, err := tls.LoadX509KeyPair("server.crt", "server.key")
 	if err != nil {
-		panic(err)
+		return nil, fmt.Errorf("loading tls certs: %w", err)
 	}
-
+	slog.Info("dialing", "addr", addr)
 	conn, err := quic.DialAddr(ctx,
 		addr,
 		&tls.Config{
@@ -377,13 +593,16 @@ func (p *ProxyClient) Dial(ctx context.Context, addr string) error {
 		&quic.Config{
 			MaxIdleTimeout:  20 * time.Second,
 			KeepAlivePeriod: 10 * time.Second,
-			EnableDatagrams: true,
 		},
 	)
 	if err != nil {
-		return fmt.Errorf("quic dialAddr failed: %w", err)
+		return nil, err
 	}
-	ctx, cancel := context.WithCancel(context.Background())
+	return conn, nil
+}
+
+func (p *Client) Listen(ctx context.Context, conn quic.Connection) error {
+	ctx, cancel := context.WithCancel(ctx)
 	go func() {
 		if err := p.rpcServer.ListenAndServe(); err != nil {
 			cancel()
@@ -394,17 +613,23 @@ func (p *ProxyClient) Dial(ctx context.Context, addr string) error {
 		stream, err := conn.AcceptStream(ctx)
 		if err != nil {
 			cancel()
+			if errors.Is(err, context.Canceled) {
+				_ = conn.CloseWithError(quic.ApplicationErrorCode(quic.ConnectionRefused), "connection closed")
+			} else {
+				_ = conn.CloseWithError(quic.ApplicationErrorCode(quic.InternalError), err.Error())
+			}
 			return fmt.Errorf("accepting stream failed: %w", err)
 		}
-		fmt.Println("accepting stream", stream.StreamID())
+		slog.Info("accepting stream", "id", stream.StreamID())
 		go func() {
 			if err := p.handleStreamProxy(ctx, stream); err != nil {
 				slog.Error("handleStreamProxy", "err", err)
 			}
+			slog.Info("stream ended", "id", stream.StreamID())
 		}()
 	}
-}
 
+}
 func copy(closer chan error, dst io.Writer, src io.Reader) {
 	_, err := io.Copy(dst, src)
 	closer <- err // connection is closed, send signal to stop proxy

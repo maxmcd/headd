@@ -2,7 +2,7 @@ package headd_test
 
 import (
 	"context"
-	"crypto/tls"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -21,6 +21,13 @@ type testServer struct {
 	*headd.Server
 	cConn     *net.UDPConn
 	pListener net.Listener
+}
+
+func init() {
+	var logger = slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{
+		Level: slog.LevelDebug,
+	}))
+	slog.SetDefault(logger)
 }
 
 func newTestServer(t *testing.T) *testServer {
@@ -43,7 +50,7 @@ func newTestServer(t *testing.T) *testServer {
 	t.Cleanup(cancel)
 	go func() {
 		if err := server.Serve(ctx, cConn, pListener); err != nil {
-			if err != context.Canceled {
+			if !errors.Is(err, context.Canceled) {
 				log.Panicln(err)
 			}
 		}
@@ -56,27 +63,37 @@ func newTestServer(t *testing.T) *testServer {
 }
 
 func TestProxy(t *testing.T) {
-	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{
-		Level: slog.LevelDebug,
-	}))
-	slog.SetDefault(logger)
-
+	ctx := context.Background()
 	server := newTestServer(t)
 	clientAddr := server.cConn.LocalAddr().String()
 	publicAddr := server.pListener.Addr().String()
-	time.Sleep(time.Millisecond * 100)
-	fmt.Println("new proxy client")
-	proxyClient, err := headd.NewProxyClient()
+	proxyClient, err := headd.NewClient()
+	if err != nil {
+		t.Fatal(err)
+	}
+	clientConn, err := proxyClient.Dial(context.Background(), clientAddr)
 	if err != nil {
 		t.Fatal(err)
 	}
 	go func() {
-		if err := proxyClient.Dial(context.Background(), clientAddr); err != nil {
-			panic(err)
+		if err := proxyClient.Listen(ctx, clientConn); err != nil {
+			if !errors.Is(err, context.Canceled) {
+				panic(err)
+			}
 		}
 	}()
-	defer func() { _ = proxyClient.Shutown() }()
-	time.Sleep(time.Second)
+	defer func() { _ = proxyClient.Shutdown() }()
+
+	for i := 0; i < 10; i++ {
+		time.Sleep(time.Millisecond * 5)
+		clients := server.Clients()
+		if len(clients) > 0 {
+			break
+		}
+		if i == 10-1 {
+			t.Fatal("No connected client")
+		}
+	}
 
 	appPort, err := server.RegisterApp(headd.App{
 		Command: "go",
@@ -87,46 +104,32 @@ func TestProxy(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	time.Sleep(time.Second)
-	time.Sleep(time.Second)
-	fmt.Println(appPort)
-
-	tlsCert, err := tls.LoadX509KeyPair("server.crt", "server.key")
-	if err != nil {
-		log.Panicln(fmt.Errorf("loading certificates: %w", err))
+	for i := 0; i < 10; i++ {
+		time.Sleep(time.Millisecond * 50)
+		apps := server.Apps()
+		if len(apps) > 0 && apps[0].Healthy {
+			break
+		}
+		if i == 10-1 {
+			t.Fatal("App never got healthy")
+		}
 	}
 
-	client := http.Client{
-		Timeout: time.Millisecond * 100,
-		Transport: &http.Transport{
-			TLSClientConfig: &tls.Config{
-				InsecureSkipVerify: true,
-				Certificates:       []tls.Certificate{tlsCert},
-				ServerName:         appPort.App.Name,
-			},
-			DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
-				return net.Dial(network, publicAddr)
-			},
-		},
-	}
-
-	req, err := http.NewRequest("GET", "https://"+appPort.App.Name, nil)
+	req, err := http.NewRequest("GET", fmt.Sprintf("http://%s/", publicAddr), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
+	req.Host = appPort.App.Name
 	req.Header.Set("host", appPort.App.Name)
-
-	resp, err := client.Do(req)
+	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer resp.Body.Close()
-	fmt.Println("resp", resp)
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		t.Fatal(err)
 	}
-	fmt.Printf("body: %q", string(body))
 	if !strings.Contains(string(body), "uptime") {
 		t.Fatal("body does not contain uptime")
 	}

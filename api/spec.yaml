@@ -1,0 +1,178 @@
+openapi: 3.0.0
+info:
+  title: Head API
+  version: 1.0.0
+  description: API for managing head hosts and builds
+
+paths:
+  /hosts:
+    get:
+      tags: [hosts]
+      security:
+        - bearerAuth: []
+      summary: List available hosts
+      responses:
+        "200":
+          description: List of hosts
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/Host"
+  /hosts/{hostId}/build:
+    post:
+      tags: [hosts, builds]
+      security:
+        - bearerAuth: []
+      summary: Start a new build
+      parameters:
+        - name: hostId
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/BuildRequest"
+      responses:
+        "201":
+          description: Build started
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Build"
+        "400":
+          $ref: "#/components/responses/BadRequestError"
+        "404":
+          $ref: "#/components/responses/NotFoundError"
+
+  /hosts/{hostId}/build/{buildId}:
+    get:
+      tags: [hosts, builds]
+      summary: Get build status
+      parameters:
+        - name: hostId
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: buildId
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Build status
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Build"
+        "404":
+          $ref: "#/components/responses/NotFoundError"
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+
+  schemas:
+    Error:
+      type: object
+      required:
+        - message
+      properties:
+        message:
+          type: string
+
+    Host:
+      description: Represents a build host in the system
+      type: object
+      required:
+        - id
+        - name
+      properties:
+        id:
+          type: string
+        name:
+          type: string
+        status:
+          type: string
+          enum: [online, offline]
+
+    BuildRequest:
+      description: Request parameters to start a new build
+      type: object
+      properties:
+        command:
+          type: string
+        args:
+          type: array
+          items:
+            type: string
+        env:
+          type: object
+          additionalProperties:
+            type: string
+        stream:
+          type: boolean
+      required:
+        - command
+        - args
+
+    Build:
+      description: Represents a build job and its status
+      type: object
+      required:
+        - id
+        - command
+        - args
+        - status
+        - createdAt
+        - completedAt
+      properties:
+        id:
+          type: string
+        command:
+          type: string
+        args:
+          type: array
+          items:
+            type: string
+        status:
+          type: string
+          enum: [pending, running, completed, failed]
+        createdAt:
+          type: string
+          format: date-time
+        completedAt:
+          type: string
+          format: date-time
+        env:
+          type: object
+          additionalProperties:
+            type: string
+        stream:
+          type: boolean
+        exitCode:
+          type: integer
+          description: Process exit code when build completes
+
+  responses:
+    NotFoundError:
+      description: Resource not found
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    BadRequestError:
+      description: Invalid request
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"

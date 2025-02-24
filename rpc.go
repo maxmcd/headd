@@ -14,6 +14,7 @@ import (
 	"net/netip"
 	"os"
 	"os/exec"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -47,19 +48,27 @@ type streamConn struct {
 
 type quicChanListener struct {
 	streamChan chan quic.Stream
+	closed     bool
 }
 
 func (l *quicChanListener) Accept() (net.Conn, error) {
 	stream, ok := <-l.streamChan
-	fmt.Println("quicChanListener Accept", stream, ok)
 	if !ok {
 		return nil, io.EOF
 	}
-	return &streamConn{stream: stream, ReadWriteCloser: stream}, nil
+
+	slog.Info("accepting stream", "stream", stream.StreamID())
+	return &streamConn{
+		stream:          stream,
+		ReadWriteCloser: stream,
+	}, nil
 }
 
 func (l *quicChanListener) Close() error {
-	fmt.Println("closing quic listener")
+	if l.closed {
+		return nil
+	}
+	l.closed = true
 	close(l.streamChan)
 	return nil
 }
@@ -74,17 +83,25 @@ func (c *streamConn) SetDeadline(t time.Time) error      { return nil }
 func (c *streamConn) SetReadDeadline(t time.Time) error  { return nil }
 func (c *streamConn) SetWriteDeadline(t time.Time) error { return nil }
 
+var ErrConnectionClosed = errors.New("client connection closed")
+
 func quicConnDial(conn quic.Connection) func(ctx context.Context, network string, addr string) (net.Conn, error) {
 	return func(ctx context.Context, network, addr string) (net.Conn, error) {
 		stream, err := conn.OpenStreamSync(ctx)
 		if err != nil {
+			if strings.HasSuffix(err.Error(), "Application error 0x2 (remote): connection closed") {
+				err = ErrConnectionClosed
+			}
 			return nil, fmt.Errorf("quicConnDial openStreamSync: %w", err)
 		}
 		if err := writeAddrToStream(stream, netip.AddrPortFrom(netip.AddrFrom4([4]byte{0, 0, 0, 0}), 0)); err != nil {
 			return nil, fmt.Errorf("quicConnDial: writing addr to stream: %w", err)
 		}
 
-		return &streamConn{stream: stream, ReadWriteCloser: stream}, nil
+		return &streamConn{
+			stream:          stream,
+			ReadWriteCloser: stream,
+		}, nil
 	}
 }
 
@@ -118,6 +135,7 @@ func NewRPC2Server(listener net.Listener) (*RPC2Server, error) {
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/Hello", func(w http.ResponseWriter, r *http.Request) {
+		slog.Info("Hello", "remote", r.RemoteAddr)
 		_ = json.NewEncoder(w).Encode(1)
 	})
 	handleRPCRequest(mux, "RegisterApp", s.RegisterApp)
@@ -225,8 +243,9 @@ func NewRPC2Client(dialer func(context.Context, string, string) (net.Conn, error
 			AllowHTTP: true, // Enable h2c support
 			DialTLSContext: func(ctx context.Context,
 				network, addr string, cfg *tls.Config) (net.Conn, error) {
-				fmt.Println("dialing", network, addr)
-				return dialer(ctx, network, addr)
+				conn, err := dialer(ctx, network, addr)
+				slog.Debug("dialing", "network", network, "addr", addr, "err", err)
+				return conn, err
 			},
 		},
 	}
@@ -267,7 +286,7 @@ func (c *RPC2Client) Hello() error {
 	defer resp.Body.Close()
 	var one int
 	if err := json.NewDecoder(resp.Body).Decode(&one); err != nil {
-		return fmt.Errorf("decoding hello body")
+		return fmt.Errorf("decoding hello body: %w", err)
 	}
 	if one != 1 {
 		return fmt.Errorf("invalid response from hello")
